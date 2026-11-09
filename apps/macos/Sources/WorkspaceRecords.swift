@@ -10,6 +10,8 @@ struct WorkspaceAsset: Identifiable, Sendable {
     var startText = "0.000000"
     var endText = "0.000000"
     var mode: ExportStrategy
+    var audioSelection: AudioSelection = .all
+    var includedInBatch = true
 }
 struct ExportDraft: Codable, Sendable {
     let assetId: UUID
@@ -18,6 +20,8 @@ struct ExportDraft: Codable, Sendable {
     let range: MediaRange
     let mode: ExportStrategy
     let configuration: BackendConfiguration
+    var audioSelection: AudioSelection = .all
+    var expectedAudioIndices: [Int]?
 }
 struct ActiveExport: Codable, Sendable {
     let id: UUID
@@ -40,6 +44,8 @@ struct WorkspaceTask: Identifiable, Codable, Sendable {
     var result: JobResult?
     var destinationBookmark: Data?
     var interrupted = false
+    var sessionId: UUID?
+    var audioSelection: AudioSelection?
 
     // Persistence excludes the native handle, whole Core response and raw paths.
     func summary() -> WorkspaceTask {
@@ -47,7 +53,7 @@ struct WorkspaceTask: Identifiable, Codable, Sendable {
         value.result = nil
         return value
     }
-    var terminal: Bool { ["succeeded", "failed", "cancelled", "interrupted"].contains(state) }
+    var terminal: Bool { ["succeeded", "failed", "cancelled", "interrupted", "unconfirmed"].contains(state) }
 }
 
 @MainActor

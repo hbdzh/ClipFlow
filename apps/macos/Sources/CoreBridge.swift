@@ -7,7 +7,7 @@ struct CoreVersion: Codable, Sendable {
     let stage: String
     let mockOnly: Bool
 }
-struct CoreFeature: Codable, Sendable { let available: Bool; let reason: String?; let profile: String? }
+struct CoreFeature: Codable, Sendable { let available: Bool; let reason: String?; let profile: String?; let profiles: [String]? }
 struct MediaBackend: Codable, Sendable {
     let name: String
     let version: String?
@@ -56,11 +56,15 @@ enum ExportStrategy: String, Codable, CaseIterable, Sendable {
     case legacyStreamCopy
     case streamCopyV1
     case accurateReencode
+    case transcodeStandard
+    case transcode720p
     var title: String {
         switch self {
         case .legacyStreamCopy: return "快速无损 · 兼容流复制"
         case .streamCopyV1: return "快速无损 · 流复制"
         case .accurateReencode: return "精确裁剪 · 重编码"
+        case .transcodeStandard: return "转码 · 标准质量"
+        case .transcode720p: return "转码 · 720p 小体积"
         }
     }
     var capabilityKey: String {
@@ -68,17 +72,27 @@ enum ExportStrategy: String, Codable, CaseIterable, Sendable {
         case .legacyStreamCopy: return "trim_stream_copy"
         case .streamCopyV1: return "trim_stream_copy_v1"
         case .accurateReencode: return "accurate_reencode"
+        case .transcodeStandard: return "transcode"
+        case .transcode720p: return "transcode"
         }
     }
     var profile: String? {
         switch self {
         case .legacyStreamCopy: return nil
         case .streamCopyV1: return "mp4_h264_copy_v1"
-        case .accurateReencode: return "mp4_h264_standard_v1"
+        case .accurateReencode, .transcodeStandard: return "mp4_h264_standard_v1"
+        case .transcode720p: return "mp4_h264_720p_v1"
         }
     }
     var wireStrategy: String { self == .accurateReencode ? "accurate_reencode" : "stream_copy" }
-    var isReencoded: Bool { self == .accurateReencode }
+    var transcodePreset: TranscodePreset? {
+        switch self {
+        case .transcodeStandard: return .standard
+        case .transcode720p: return .compact720p
+        default: return nil
+        }
+    }
+    var isReencoded: Bool { self == .accurateReencode || transcodePreset != nil }
 }
 
 struct AccuratePlan: Codable, Sendable {
@@ -107,6 +121,7 @@ struct AudioContentValidation: Codable, Sendable {
 struct OutputValidation: Codable, Sendable {
     // These are present in both accepted output contracts and stay required.
     let allStreamsRetained: Bool
+    let allSelectedStreamsRetained: Bool?
     let verifiedVideoFrames: Int
     let decodeAllStreams: Bool
     let packetDtsMonotonic: Bool
@@ -130,9 +145,10 @@ struct OutputValidation: Codable, Sendable {
     let audioBandlimitedContent: AudioContentValidation?
 
     func hasRequiredEvidence(for strategy: ExportStrategy) -> Bool {
-        guard allStreamsRetained, verifiedVideoFrames > 0, decodeAllStreams,
+        guard (strategy.transcodePreset != nil ? allSelectedStreamsRetained == true : allStreamsRetained),
+              verifiedVideoFrames > 0, decodeAllStreams,
               packetDtsMonotonic, sourceIdentityUnchanged else { return false }
-        if strategy == .accurateReencode {
+        if strategy.isReencoded {
             // Presence is mandatory; numeric media acceptance remains in Core.
             return decodedPresentationPtsMonotonic == true
                 && (verifiedOutputPacketCount ?? 0) > 0
@@ -160,16 +176,19 @@ struct JobResult: Codable, Sendable {
     let reencoded: Bool?
     let lossless: Bool?
     let accuratePlan: AccuratePlan?
+    let transcodePlan: TranscodePlan?
     var exportStrategy: ExportStrategy? {
         guard fileCreated else { return nil }
         if strategy == nil && profile == nil { return .legacyStreamCopy }
         if strategy == "stream_copy", profile == "mp4_h264_copy_v1" { return .streamCopyV1 }
         if strategy == "accurate_reencode", profile == "mp4_h264_standard_v1" { return .accurateReencode }
+        if strategy == "transcode", profile == "mp4_h264_standard_v1" { return .transcodeStandard }
+        if strategy == "transcode", profile == "mp4_h264_720p_v1" { return .transcode720p }
         return nil
     }
     enum CodingKeys: String, CodingKey {
         case mockOnly, fileCreated, mediaInfo, requestedRangeUs, actualRangeUs, actualSourceRangeUs
-        case outputMediaInfo, validation, strategy, profile, reencoded, lossless, accuratePlan
+        case outputMediaInfo, validation, strategy, profile, reencoded, lossless, accuratePlan, transcodePlan
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -186,12 +205,14 @@ struct JobResult: Codable, Sendable {
         reencoded = try c.decodeIfPresent(Bool.self, forKey: .reencoded)
         lossless = try c.decodeIfPresent(Bool.self, forKey: .lossless)
         accuratePlan = try c.decodeIfPresent(AccuratePlan.self, forKey: .accuratePlan)
+        transcodePlan = try c.decodeIfPresent(TranscodePlan.self, forKey: .transcodePlan)
         if fileCreated {
             guard !mockOnly, requestedRangeUs != nil, actualRangeUs != nil,
                   actualSourceRangeUs != nil, outputMediaInfo != nil,
                   let mode = exportStrategy, validation?.hasRequiredEvidence(for: mode) == true,
                   (mode == .legacyStreamCopy || (reencoded == mode.isReencoded && lossless == !mode.isReencoded)),
-                  (mode != .accurateReencode || accuratePlan != nil) else {
+                  (!mode.isReencoded || accuratePlan != nil),
+                  (mode.transcodePreset == nil || transcodePlan?.matches(profile: profile, output: outputMediaInfo) == true) else {
                 throw DecodingError.dataCorruptedError(forKey: .validation, in: c,
                     debugDescription: "Core output lacks the declared strategy's required validation evidence.")
             }
@@ -205,14 +226,19 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
     let maxOutputBytes: UInt64
     let core003Enabled: Bool
     let accurateReencodeTimeoutMs: UInt64
+    let core004Enabled: Bool
+    let transcodeTimeoutMs: UInt64
     init(ffmpeg: String, ffprobe: String, timeoutMs: UInt64, maxOutputBytes: UInt64,
-         core003Enabled: Bool = false, accurateReencodeTimeoutMs: UInt64 = 600000) {
+         core003Enabled: Bool = false, accurateReencodeTimeoutMs: UInt64 = 600000,
+         core004Enabled: Bool = false, transcodeTimeoutMs: UInt64 = 600000) {
         self.ffmpeg = ffmpeg; self.ffprobe = ffprobe; self.timeoutMs = timeoutMs
         self.maxOutputBytes = maxOutputBytes; self.core003Enabled = core003Enabled
         self.accurateReencodeTimeoutMs = accurateReencodeTimeoutMs
+        self.core004Enabled = core004Enabled; self.transcodeTimeoutMs = transcodeTimeoutMs
     }
     enum CodingKeys: String, CodingKey {
         case ffmpeg, ffprobe, timeoutMs, maxOutputBytes, core003Enabled, accurateReencodeTimeoutMs
+        case core004Enabled, transcodeTimeoutMs
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -221,6 +247,8 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
         maxOutputBytes = try c.decode(UInt64.self, forKey: .maxOutputBytes)
         core003Enabled = try c.decodeIfPresent(Bool.self, forKey: .core003Enabled) ?? false
         accurateReencodeTimeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .accurateReencodeTimeoutMs) ?? 600000
+        core004Enabled = try c.decodeIfPresent(Bool.self, forKey: .core004Enabled) ?? false
+        transcodeTimeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .transcodeTimeoutMs) ?? 600000
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -231,8 +259,13 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
             try c.encode(true, forKey: .core003Enabled)
             try c.encode(accurateReencodeTimeoutMs, forKey: .accurateReencodeTimeoutMs)
         }
+        // Opt-in remains explicit. Core rejects core004=true/core003=false.
+        if core004Enabled {
+            try c.encode(true, forKey: .core004Enabled)
+            try c.encode(transcodeTimeoutMs, forKey: .transcodeTimeoutMs)
+        }
     }
-    static func hostDefault(core003Enabled: Bool = false) -> Self {
+    static func hostDefault(core003Enabled: Bool = false, core004Enabled: Bool = false) -> Self {
         let environment = ProcessInfo.processInfo.environment
         return Self(ffmpeg: environment["MEDIASTUDIO_FFMPEG"] ?? "/opt/homebrew/bin/ffmpeg",
                     ffprobe: environment["MEDIASTUDIO_FFPROBE"] ?? "/opt/homebrew/bin/ffprobe",
@@ -240,7 +273,10 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
                     maxOutputBytes: UInt64(environment["MEDIASTUDIO_MAX_OUTPUT_BYTES"] ?? "8388608") ?? 0,
                     core003Enabled: core003Enabled,
                     accurateReencodeTimeoutMs: core003Enabled
-                        ? UInt64(environment["MEDIASTUDIO_ACCURATE_TIMEOUT_MS"] ?? "600000") ?? 0 : 600000)
+                        ? UInt64(environment["MEDIASTUDIO_ACCURATE_TIMEOUT_MS"] ?? "600000") ?? 0 : 600000,
+                    core004Enabled: core004Enabled,
+                    transcodeTimeoutMs: core004Enabled
+                        ? UInt64(environment["MEDIASTUDIO_TRANSCODE_TIMEOUT_MS"] ?? "600000") ?? 0 : 600000)
     }
 }
 private struct EngineConfiguration: Encodable {
@@ -264,6 +300,32 @@ private struct TrimRequest: Encodable {
     let profile: String?
     let streamSelection = "all_supported"
     let allowReencodeFallback = false
+}
+private struct BatchRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "batch_submit"
+    let submissionId: String
+    let items: [QueueMediaRequest]
+}
+private struct QueueSnapshotRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "queue_snapshot"
+}
+private struct QueueReorderRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "queue_reorder"
+    let jobIds: [String]
+}
+private struct QueueRetryRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "job_retry"
+    let jobId: String
+    let newDestination: MediaLocation
+    let submissionId: String
+}
+private struct QueueClearRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "history_clear"
 }
 private func requestData(_ value: some Encodable) throws -> Data {
     let encoder = JSONEncoder()
@@ -368,6 +430,19 @@ private final class EngineOwner {
         knownJobs.insert(response.jobId)
         return response
     }
+    func control<T: Decodable>(_ data: Data, as: T.Type) throws -> T {
+        try data.withUnsafeBytes { bytes in
+            try output("queue_control") { engine, out in
+                ms_submit_job(engine, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, out)
+            }
+        }
+    }
+    func remember(_ ids: [String]) { knownJobs.formUnion(ids) }
+    func forget(_ id: String) { knownJobs.remove(id) }
+    func reconcile(_ snapshot: QueueSnapshot) {
+        knownJobs = Set(snapshot.queuedJobIds + snapshot.history.map(\.jobId))
+        if let running = snapshot.runningJobId { knownJobs.insert(running) }
+    }
     func poll(_ id: String) throws -> JobSnapshot {
         let bytes = Array(id.utf8)
         return try bytes.withUnsafeBufferPointer { bytes in
@@ -420,7 +495,8 @@ actor CoreBridge {
         try submitRawForSelfTest(requestData(ProbeRequest(source: MediaLocation(uri: source.absoluteString))))
     }
     func submitTrim(source: URL, destination: URL, range: MediaRange, strategy: ExportStrategy = .legacyStreamCopy) throws -> JobSnapshot {
-        try submitRawForSelfTest(requestData(TrimRequest(source: MediaLocation(uri: source.absoluteString),
+        guard strategy.transcodePreset == nil else { throw BridgeError(code: -1, operation: "trim_strategy") }
+        return try submitRawForSelfTest(requestData(TrimRequest(source: MediaLocation(uri: source.absoluteString),
                                                        destination: MediaLocation(uri: destination.absoluteString), range: range,
                                                        strategy: strategy.wireStrategy, profile: strategy.profile)))
     }
@@ -429,6 +505,81 @@ actor CoreBridge {
         guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
         return try owner.submit(data)
+    }
+    private func control(_ data: Data, operation: String, submissionId: String? = nil,
+                         expectedJobs: Int? = nil) throws -> QueueControlResponse {
+        guard !closing else { throw BridgeError(code: -7, operation: "closing") }
+        guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
+        guard backend?.core004Enabled == true, let owner else {
+            throw BridgeError(code: -8, operation: "core004_not_enabled")
+        }
+        // A decoding failure can follow acceptance. Caller retains its immutable
+        // token/payload/leases and may replay this SAME request to recover IDs.
+        let response = try owner.control(data, as: QueueControlResponse.self)
+        guard response.schemaVersion == 0, response.operation == operation else {
+            throw BridgeError(code: -100, operation: "control_response_mismatch")
+        }
+        if response.accepted {
+            if let submissionId, let expectedJobs {
+                guard response.submissionId == submissionId, response.replayed != nil,
+                      let ids = response.jobIds, ids.count == expectedJobs,
+                      Set(ids).count == ids.count, ids.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 128 }) else {
+                    throw BridgeError(code: -100, operation: "submission_receipt_unconfirmed")
+                }
+                owner.remember(ids)
+            }
+        } else {
+            guard response.jobIds == nil, let errors = response.errors, !errors.isEmpty else {
+                throw BridgeError(code: -100, operation: "rejection_receipt_unconfirmed")
+            }
+            if errors.contains(where: { $0.code == "CLEANUP_FAILED" }) { cleanupUnconfirmed = true }
+        }
+        return response
+    }
+    func batchSubmit(items: [QueueMediaRequest], submissionId: String) throws -> QueueControlResponse {
+        try control(requestData(BatchRequest(submissionId: submissionId, items: items)),
+                    operation: "batch_submit", submissionId: submissionId, expectedJobs: items.count)
+    }
+    func queueSnapshot() throws -> QueueSnapshot {
+        guard !closing else { throw BridgeError(code: -7, operation: "closing") }
+        guard let owner, backend?.core004Enabled == true else {
+            throw BridgeError(code: -8, operation: "core004_not_enabled")
+        }
+        return try currentQueueSnapshot(owner)
+    }
+    private func currentQueueSnapshot(_ owner: EngineOwner) throws -> QueueSnapshot {
+        let response = try owner.control(requestData(QueueSnapshotRequest()), as: QueueSnapshot.self)
+        guard response.schemaVersion == 0, response.operation == "queue_snapshot",
+              response.queueCapacity == 32, response.historyLimit == 100,
+              response.activeCount >= 0, response.activeCount <= response.queueCapacity,
+              Set(response.queuedJobIds).count == response.queuedJobIds.count else {
+            throw BridgeError(code: -100, operation: "queue_snapshot_unconfirmed")
+        }
+        if response.cleanupUnconfirmed || response.resources.globalQuarantined { cleanupUnconfirmed = true }
+        owner.reconcile(response)
+        return response
+    }
+    func reorderQueue(jobIDs: [String]) throws -> QueueControlResponse {
+        let value = try control(requestData(QueueReorderRequest(jobIds: jobIDs)), operation: "queue_reorder")
+        if value.accepted && value.queuedJobIds != jobIDs {
+            throw BridgeError(code: -100, operation: "queue_order_unconfirmed")
+        }
+        return value
+    }
+    func retry(jobID: String, newDestination: URL, submissionId: String) throws -> QueueControlResponse {
+        try control(requestData(QueueRetryRequest(jobId: jobID,
+                    newDestination: MediaLocation(uri: newDestination.absoluteString), submissionId: submissionId)),
+                    operation: "job_retry", submissionId: submissionId, expectedJobs: 1)
+    }
+    func clearHistory() throws -> QueueControlResponse {
+        let value = try control(requestData(QueueClearRequest()), operation: "history_clear")
+        if value.accepted {
+            guard let count = value.clearedCount, count >= 0 else {
+                throw BridgeError(code: -100, operation: "history_clear_unconfirmed")
+            }
+            if let owner { _ = try currentQueueSnapshot(owner) }
+        }
+        return value
     }
     func poll(id: String) throws -> JobSnapshot {
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
@@ -447,14 +598,26 @@ actor CoreBridge {
         closing = true
         defer { closing = false }
         do {
-            for id in owner.jobIDs { try owner.cancel(id) }
+            // Queue history is bounded/clearable; discover current active IDs,
+            // including any accepted submission whose receipt failed decoding.
+            if backend?.core004Enabled == true { _ = try currentQueueSnapshot(owner) }
+            guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
+            for id in owner.jobIDs {
+                do { try owner.cancel(id) }
+                catch let error as BridgeError where error.code == -6 { owner.forget(id) }
+            }
             // Cancellation is a separate bounded drain, not the media encode deadline.
             // Do not wait 600s merely because accurate processing permits that long.
             let deadline = ContinuousClock.now + .seconds(15)
             while true {
                 var active = false
                 for id in owner.jobIDs {
-                    let snapshot = try owner.poll(id)
+                    let snapshot: JobSnapshot
+                    do { snapshot = try owner.poll(id) }
+                    catch let error as BridgeError where error.code == -6 {
+                        owner.forget(id)
+                        continue
+                    }
                     active = active || !["succeeded", "failed", "cancelled"].contains(snapshot.state)
                     if snapshot.error?.code == "CLEANUP_FAILED" { cleanupUnconfirmed = true }
                     if ["succeeded", "failed", "cancelled"].contains(snapshot.state) {

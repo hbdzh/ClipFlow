@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build a host-only MAC-002 native app bundle without external build dependencies."""
+"""Build a host-only MAC-003 native app bundle without external build dependencies."""
 from pathlib import Path
 import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -14,11 +15,23 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 BUILD = HERE / 'build'
 APP = BUILD / 'MediaStudioSpike.app'
-RECORD = HERE / 'evidence' / 'mac-002' / 'build.json'
+RECORD = HERE / 'evidence' / 'mac-003' / 'build.json'
 
 
 class UnsafeBuildPath(ValueError):
     pass
+
+
+def bundle_identity(environment=None):
+    values = os.environ if environment is None else environment
+    identifier = values.get('MEDIASTUDIO_BUNDLE_ID', 'local.mediastudio.ui001')
+    name = values.get('MEDIASTUDIO_BUNDLE_NAME', 'MediaStudio')
+    segment = r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?'
+    if len(identifier) > 255 or re.fullmatch(segment + r'(?:\.' + segment + r')+', identifier) is None:
+        raise ValueError('MEDIASTUDIO_BUNDLE_ID must be a bounded reverse-domain bundle identifier')
+    if not name.strip() or len(name) > 128 or any(ord(c) < 32 or ord(c) == 127 or c in '/\\' for c in name):
+        raise ValueError('MEDIASTUDIO_BUNDLE_NAME must be a bounded display name without controls or path separators')
+    return identifier, name
 
 
 def assert_safe_output(anchor, target, *, allow_hardlinks=False):
@@ -86,6 +99,7 @@ def write_record(data):
 
 
 def main():
+    identifier, bundle_name = bundle_identity()
     check_layout()
     safe_mkdir(BUILD)
     safe_mkdir(RECORD.parent)
@@ -128,7 +142,7 @@ def main():
     assert_safe_output(HERE, binary)
     assert_safe_output(HERE, BUILD / 'ModuleCache')
     run(args)
-    info = {'CFBundleIdentifier': 'local.mediastudio.ui001', 'CFBundleName': 'MediaStudio',
+    info = {'CFBundleIdentifier': identifier, 'CFBundleName': bundle_name,
             'CFBundleExecutable': 'MediaStudioSpike', 'CFBundlePackageType': 'APPL',
             'CFBundleShortVersionString': '0.1.0', 'CFBundleVersion': '1',
             'LSMinimumSystemVersion': '27.0', 'NSHighResolutionCapable': True,
@@ -144,7 +158,9 @@ def main():
         run(argv)
     artifacts = [{'path': str(p.relative_to(ROOT)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest(),
                   'bytes': p.stat().st_size, 'committed': False} for p in [source, library, binary]]
-    write_record({'result': 'PASS', 'scope': 'MAC-002 host arm64-macosx27.0 workspace, not product minimum OS or distribution',
+    write_record({'result': 'PASS', 'bundle_identity': {'identifier': identifier, 'name': bundle_name},
+                                 'reproduction_environment': {'MEDIASTUDIO_BUNDLE_ID': identifier, 'MEDIASTUDIO_BUNDLE_NAME': bundle_name},
+                                 'scope': 'MAC-003 host arm64-macosx27.0 workspace, not product minimum OS or distribution',
                                  'signing': 'ad-hoc only; no identity/certificate/notarization',
                                  'canonical_header_sha256': hashlib.sha256(header.read_bytes()).hexdigest(),
                                  'commands': commands, 'artifacts': artifacts})
