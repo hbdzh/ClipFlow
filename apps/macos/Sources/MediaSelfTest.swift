@@ -43,7 +43,7 @@ func runMediaSelfTest() async throws -> MediaSelfTestReport {
             throw CheckFailure(message: "Preview frame must be a new separate absolute PNG")
         }
     }
-    let model = WorkspaceModel()
+    let model = WorkspaceModel(legacyCompatibility: true)
     var heartbeat = 0
     let heartbeatTask = Task { @MainActor in
         while !Task.isCancelled {
