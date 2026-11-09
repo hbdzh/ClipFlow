@@ -1,0 +1,7 @@
+{
+  "schema_version": 0,
+  "operation": "probe",
+  "source": {
+    "uri": "file:///EXAMPLE/input.mp4"
+  }
+}

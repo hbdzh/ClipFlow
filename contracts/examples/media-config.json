@@ -1,0 +1,10 @@
+{
+  "schema_version": 0,
+  "max_jobs": 64,
+  "media_backend": {
+    "ffmpeg": "/opt/homebrew/bin/ffmpeg",
+    "ffprobe": "/opt/homebrew/bin/ffprobe",
+    "timeout_ms": 30000,
+    "max_output_bytes": 8388608
+  }
+}

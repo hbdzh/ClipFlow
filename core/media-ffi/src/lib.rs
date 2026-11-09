@@ -142,8 +142,8 @@ pub unsafe extern "C" fn ms_engine_destroy(handle: *mut ms_engine) -> i32 {
         if !wrapper.quarantined && wrapper.inner.has_active_jobs() {
             return Err(CoreError::Busy);
         }
-        // SAFETY: this is the original Box pointer, consumed only once. Mock jobs
-        // own no external resources; a quarantined mock engine can be dropped.
+        // SAFETY: this is the original Box pointer, consumed only once. Engine's
+        // Drop cancels and joins its worker; destroy must run off the UI thread.
         drop(unsafe { Box::from_raw(handle) });
         Ok(())
     })
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn ms_get_capabilities(
     })
 }
 
-/// Submit a mock request. Real media operations are rejected without any I/O.
+/// Submit a mock request, or a real media request with an explicit backend config.
 ///
 /// # Safety
 /// handle is live and exclusive, request_len input bytes remain readable for the
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn ms_submit_job(
     })
 }
 
-/// Poll the deterministic mock state machine using a plain UTF-8 job ID.
+/// Poll a job using a plain UTF-8 ID. Media snapshots only observe the worker.
 ///
 /// # Safety
 /// handle is live and exclusive, job_id_len bytes are valid readable memory for
@@ -231,7 +231,7 @@ pub unsafe extern "C" fn ms_get_job_snapshot(
     })
 }
 
-/// Request mock cancellation; successful return does not mean terminal cancellation.
+/// Request cancellation; successful return does not mean active work is cleaned up.
 ///
 /// # Safety
 /// handle is live and exclusive; job_id_len readable bytes are valid for this call.

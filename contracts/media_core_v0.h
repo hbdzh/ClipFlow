@@ -42,8 +42,9 @@ enum {
  * Over-limit lengths take precedence and return LIMIT_EXCEEDED; otherwise all
  * three empty/null combinations are INVALID_ARGUMENT.
  * config: {"schema_version":0,"max_jobs":64}; max_jobs optional, 1..256.
+ * Optional media_backend enables CORE-002; see CORE-002.md. Default stays mock.
  * On error out_engine is NULL. Caller owns one live handle until destroy OK.
- * destroy returns BUSY without consuming an engine with nonterminal mock jobs.
+ * destroy returns BUSY without consuming an engine with nonterminal jobs.
  * Cancel and poll to terminal before retrying. Never block a UI on shutdown.
  */
 int32_t ms_engine_create(const uint8_t *config_json, size_t config_len, ms_engine **out_engine);
@@ -53,8 +54,9 @@ int32_t ms_engine_destroy(ms_engine *engine);
  * On any error it is {NULL,0}; no diagnostic JSON buffer is allocated on error.
  * On success Rust allocates bytes; do not edit ptr/len or free with C free().
  * Each buffer is independent of engine lifetime and freed exactly once below.
- * Only operation "mock" is accepted; real probe/trim are unavailable.
- * See README.md for strict fields, deterministic polling and panic policy.
+ * Default only accepts "mock". Explicit media_backend allows probe/trim jobs;
+ * media polling observes a worker; it never advances work by itself.
+ * See README.md and CORE-002.md for strict fields, cleanup and panic policy.
  */
 int32_t ms_get_version(ms_engine *engine, ms_buffer *out_json);
 int32_t ms_get_capabilities(ms_engine *engine, ms_buffer *out_json);
