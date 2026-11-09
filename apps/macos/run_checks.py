@@ -52,8 +52,8 @@ def main():
             'usable_bundle_preserved': True,
             'source_digest': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted((HERE / 'Sources').glob('*.swift'))}}
-    assert_safe_output(HERE, HERE / 'evidence/self-test.json')
-    (HERE / 'evidence/self-test.json').write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+    assert_safe_output(HERE, HERE / 'evidence/ui-001/legacy-self-test.json')
+    (HERE / 'evidence/ui-001/legacy-self-test.json').write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
     print('MAC-001 self-test:', len(report['checks']), 'checks PASS;', report['lifecycle_iterations'], 'lifecycle iterations')
     print('Missing-dylib startup negative: PASS; original app preserved')
 
