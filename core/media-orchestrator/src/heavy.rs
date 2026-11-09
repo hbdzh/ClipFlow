@@ -8,7 +8,15 @@ pub(crate) struct Permit {
     poisoned: bool,
 }
 pub(crate) fn quarantined() -> bool {
-    QUARANTINED.load(Ordering::Acquire) || media_ffmpeg::quarantined()
+    let base = QUARANTINED.load(Ordering::Acquire) || media_ffmpeg::quarantined();
+    #[cfg(target_os = "macos")]
+    {
+        base || media_ai::transaction_quarantined() || media_ai::runner::is_quarantined()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        base
+    }
 }
 pub(crate) fn quarantine() {
     QUARANTINED.store(true, Ordering::Release);

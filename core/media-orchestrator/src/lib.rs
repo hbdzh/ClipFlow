@@ -3,6 +3,8 @@
 //! A bounded job engine shared by the CLI and FFI. Mock jobs remain poll-driven;
 //! explicitly configured media jobs run on one serial worker per engine.
 
+#[cfg(target_os = "macos")]
+mod ai;
 mod heavy;
 mod queue;
 use std::collections::BTreeMap;
@@ -342,7 +344,9 @@ impl Engine {
         }
         if matches!(
             request,
-            Request::Queue(_) | Request::Media(MediaRequest::Transcode { .. })
+            Request::Queue(_)
+                | Request::AiSeparate { .. }
+                | Request::Media(MediaRequest::Transcode { .. })
         ) {
             return Err(CoreError::UnsupportedOperation);
         }
@@ -363,7 +367,9 @@ impl Engine {
             self.next_id
         );
         let (job, response) = match request {
-            Request::Queue(_) => return Err(CoreError::UnsupportedOperation),
+            Request::Queue(_) | Request::AiSeparate { .. } => {
+                return Err(CoreError::UnsupportedOperation);
+            }
             Request::Mock(outcome) => {
                 let job = MockJob {
                     state: JobState::Queued,

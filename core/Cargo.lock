@@ -9,6 +9,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "media-ai"
+version = "0.1.0-dev"
+
+[[package]]
 name = "media-cli"
 version = "0.1.0-dev"
 dependencies = [
@@ -45,6 +49,7 @@ dependencies = [
 name = "media-orchestrator"
 version = "0.1.0-dev"
 dependencies = [
+ "media-ai",
  "media-domain",
  "media-ffmpeg",
  "serde_json",

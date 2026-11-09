@@ -302,6 +302,7 @@ mod tests {
             core004_enabled: false,
             transcode_timeout_ms: 600000,
             max_output_bytes,
+            ai_backend: None,
         }
     }
 
@@ -344,5 +345,123 @@ mod tests {
             .run(Path::new("/usr/bin/yes"), &[])
             .expect_err("output must be bounded");
         assert_eq!(error.code, "RESOURCE_LIMIT");
+    }
+
+    /// Explicit local experiment: the production engine does not dispatch AI jobs.
+    /// This exercises the existing Core child owner with the real research worker.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the separately provisioned AI-001 local research environment"]
+    fn ai001_real_worker_child_success_and_cancellation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        let required = |key: &str| PathBuf::from(std::env::var_os(key).expect(key));
+        let python = required("AI001_PYTHON");
+        let worker = required("AI001_WORKER");
+        let model = required("AI001_MODEL");
+        let input = required("AI001_INPUT");
+        for path in [&python, &worker, &model, &input] {
+            assert!(path.is_absolute() && path.is_file());
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ai001-core-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).expect("private test root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let staging = root.join("success");
+        std::fs::create_dir(&staging).expect("staging");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let worker_args = |dir: &Path| {
+            vec![
+                worker.clone().into_os_string(),
+                "--model".into(),
+                model.clone().into_os_string(),
+                "--input".into(),
+                input.clone().into_os_string(),
+                "--staging".into(),
+                dir.as_os_str().to_owned(),
+            ]
+        };
+        let settings = config(30_000, 16_384);
+        let flag = AtomicBool::new(false);
+        let output = Context::new(&settings, &flag)
+            .run(&python, &worker_args(&staging))
+            .expect("real CPU worker");
+        let response: serde_json::Value = serde_json::from_slice(&output).expect("worker response");
+        assert_eq!(response["sample_rate"], 44_100);
+        assert_eq!(response["channels"], 2);
+        assert!(staging.join("vocals.wav").is_file());
+        assert!(staging.join("accompaniment.wav").is_file());
+
+        // The wrapper records its PID then execs the research worker in place.
+        // Observe its actual command before signalling; inference is not gated.
+        let wrapper = root.join("exec_worker.py");
+        std::fs::write(&wrapper, "import os,sys\nopen(sys.argv[1], 'x').write(str(os.getpid()))\nos.execv(sys.executable, [sys.executable] + sys.argv[2:])\n").expect("wrapper");
+        let cancel_dir = root.join("cancel");
+        std::fs::create_dir(&cancel_dir).expect("cancel staging");
+        std::fs::set_permissions(&cancel_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("mode");
+        let marker = root.join("started");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let wait_marker = marker.clone();
+        let expected_worker = worker.to_string_lossy().into_owned();
+        let wrapper_name = wrapper.to_string_lossy().into_owned();
+        let signaler = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut observed = None;
+            while Instant::now() < until {
+                if let Ok(pid) = std::fs::read_to_string(&wait_marker)
+                    && let Ok(pid) = pid.parse::<u32>()
+                    && let Ok(output) = std::process::Command::new("/bin/ps")
+                        .args(["-p", &pid.to_string(), "-o", "command="])
+                        .output()
+                    && output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&expected_worker)
+                    && !String::from_utf8_lossy(&output.stdout).contains(&wrapper_name)
+                {
+                    observed = Some(pid);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            signal.store(true, Ordering::Release);
+            observed
+        });
+        let mut command = vec![wrapper.into_os_string(), marker.clone().into_os_string()];
+        command.extend(worker_args(&cancel_dir));
+        let error = Context::new(&settings, &cancelled)
+            .run(&python, &command)
+            .expect_err("cancel real child");
+        let pid = signaler
+            .join()
+            .expect("signaler")
+            .expect("worker exec observed");
+        assert_eq!(error.code, "CANCELLED");
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .expect("check child exit");
+        assert!(!alive.status.success(), "direct child must have exited");
+        // Fault injection exercises the same child owner when a process exits
+        // after producing a partial file. The test, not the product, cleans it.
+        let fault_dir = root.join("fault");
+        std::fs::create_dir(&fault_dir).expect("fault staging");
+        let fault = vec![
+            "-c".into(),
+            "import os,sys; open(sys.argv[1], 'xb').write(b'partial'); os._exit(17)".into(),
+            fault_dir.join("partial.wav").into_os_string(),
+        ];
+        let error = Context::new(&settings, &flag)
+            .run(&python, &fault)
+            .expect_err("injected crash");
+        assert_eq!(error.code, "PROCESS_FAILED");
+        assert!(fault_dir.join("partial.wav").is_file());
+        // Context has reaped its direct child on return. The test owns the private
+        // root, not product cleanup or output publication semantics.
+        std::fs::remove_dir_all(&root).expect("remove test-owned staging");
+        assert!(!root.exists());
     }
 }

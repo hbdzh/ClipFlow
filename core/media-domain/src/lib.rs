@@ -64,6 +64,17 @@ pub struct BackendConfig {
     pub core004_enabled: bool,
     pub transcode_timeout_ms: u64,
     pub max_output_bytes: usize,
+    pub ai_backend: Option<AiBackendConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AiBackendConfig {
+    pub python: PathBuf,
+    pub worker: PathBuf,
+    pub model: PathBuf,
+    pub timeout_ms: u64,
+    /// Explicit trusted local-only workspace for the development path.
+    pub development_root: Option<PathBuf>,
 }
 
 pub const ACCURATE_REENCODE_PROFILE: &str = "mp4_h264_standard_v1";
@@ -157,6 +168,10 @@ pub enum Request {
     Mock(MockOutcome),
     Media(MediaRequest),
     Queue(QueueCommand),
+    AiSeparate {
+        source: PathBuf,
+        destination: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +257,7 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
             "core004_enabled",
             "transcode_timeout_ms",
             "max_output_bytes",
+            "ai_backend",
         ],
     )?;
     let executable = |name: &str| -> Result<PathBuf, CoreError> {
@@ -282,6 +298,10 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
     if core004_enabled && !core003_enabled {
         return Err(CoreError::InvalidArgument);
     }
+    let ai_backend = map.get("ai_backend").map(parse_ai_backend).transpose()?;
+    if ai_backend.is_some() && (!core003_enabled || !core004_enabled) {
+        return Err(CoreError::InvalidArgument);
+    }
     if !(1..=7_200_000).contains(&transcode_timeout_ms)
         || !(1..=300_000).contains(&timeout_ms)
         || !(1..=7_200_000).contains(&accurate_reencode_timeout_ms)
@@ -298,6 +318,50 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         core004_enabled,
         transcode_timeout_ms,
         max_output_bytes: max_output_bytes as usize,
+        ai_backend,
+    })
+}
+
+fn parse_ai_backend(value: &Value) -> Result<AiBackendConfig, CoreError> {
+    let map = value.as_object().ok_or(CoreError::InvalidArgument)?;
+    allowed_fields(
+        map,
+        &[
+            "python",
+            "worker",
+            "model",
+            "timeout_ms",
+            "development_root",
+        ],
+    )?;
+    let path = |key: &str| -> Result<PathBuf, CoreError> {
+        let value = map
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or(CoreError::InvalidArgument)?;
+        let path = PathBuf::from(value);
+        if value.is_empty() || value.contains('\0') || !path.is_absolute() {
+            return Err(CoreError::InvalidArgument);
+        }
+        Ok(path)
+    };
+    let timeout_ms = match map.get("timeout_ms") {
+        None => 600_000,
+        Some(value) => value.as_u64().ok_or(CoreError::InvalidArgument)?,
+    };
+    if !(1..=7_200_000).contains(&timeout_ms) {
+        return Err(CoreError::InvalidArgument);
+    }
+    let development_root = map
+        .get("development_root")
+        .map(|_| path("development_root"))
+        .transpose()?;
+    Ok(AiBackendConfig {
+        python: path("python")?,
+        worker: path("worker")?,
+        model: path("model")?,
+        timeout_ms,
+        development_root,
     })
 }
 
@@ -362,6 +426,10 @@ pub fn file_uri(path: &Path) -> Result<String, CoreError> {
 }
 
 pub fn parse_request(input: &[u8]) -> Result<Request, CoreError> {
+    parse_request_with_ai(input, false)
+}
+
+pub fn parse_request_with_ai(input: &[u8], ai_enabled: bool) -> Result<Request, CoreError> {
     let map = object(input)?;
     match map
         .get("operation")
@@ -453,6 +521,29 @@ pub fn parse_request(input: &[u8]) -> Result<Request, CoreError> {
                 )?,
                 submission_id: parse_submission_id(map.get("submission_id"))?,
             }))
+        }
+        "ai_separate" => {
+            // Preserve the legacy unsupported-operation result if not opted in.
+            if !ai_enabled {
+                return Err(CoreError::UnsupportedOperation);
+            }
+            allowed_fields(
+                &map,
+                &[
+                    "schema_version",
+                    "operation",
+                    "source",
+                    "destination",
+                    "model_id",
+                ],
+            )?;
+            if map.get("model_id").and_then(Value::as_str) != Some("umx_hq_vocals_onnx_v1") {
+                return Err(CoreError::InvalidArgument);
+            }
+            Ok(Request::AiSeparate {
+                source: uri_path(map.get("source").ok_or(CoreError::InvalidArgument)?)?,
+                destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
+            })
         }
         "probe" => {
             allowed_fields(&map, &["schema_version", "operation", "source"])?;

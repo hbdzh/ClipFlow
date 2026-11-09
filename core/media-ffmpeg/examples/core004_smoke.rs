@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         core003_enabled: true,
         core004_enabled: true,
         max_output_bytes: 16 * 1024 * 1024,
+        ai_backend: None,
     };
     let req = MediaRequest::Transcode {
         source: PathBuf::from(&args[1]),
