@@ -37,6 +37,18 @@ pub(crate) fn video(
     end: usize,
     rate: Rational,
 ) -> Result<Value, MediaError> {
+    video_scaled(context, source, output, start, end, rate, None)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn video_scaled(
+    context: &Context<'_>,
+    source: &Path,
+    output: &Path,
+    start: usize,
+    end: usize,
+    rate: Rational,
+    scale: Option<&str>,
+) -> Result<Value, MediaError> {
     let mut command = args(&[
         "-hide_banner",
         "-nostdin",
@@ -55,7 +67,8 @@ pub(crate) fn video(
     // an exact one-tick-per-frame clock: AVTB rounding can otherwise omit the
     // final pair for a fractional source origin (e.g. frame 10 at 30fps).
     let filter = format!(
-        "[0:v:0]trim=start_frame={start}:end_frame={end},settb={den}/{num},setpts=N[r];[1:v:0]settb={den}/{num},setpts=N[o];[r][o]psnr=stats_file=-:shortest=1:repeatlast=0[v]",
+        "[0:v:0]trim=start_frame={start}:end_frame={end},settb={den}/{num},setpts=N{scale}[r];[1:v:0]settb={den}/{num},setpts=N[o];[r][o]psnr=stats_file=-:shortest=1:repeatlast=0[v]",
+        scale = scale.map(|s| format!(",{s}")).unwrap_or_default(),
         den = rate.denominator,
         num = rate.numerator
     );
@@ -171,6 +184,26 @@ pub(crate) fn audio(
     end_us: i64,
     channels: &[usize],
 ) -> Result<Value, MediaError> {
+    audio_selected(
+        context,
+        source,
+        output,
+        start_us,
+        end_us,
+        channels,
+        &(0..channels.len()).collect::<Vec<_>>(),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audio_selected(
+    context: &Context<'_>,
+    source: &Path,
+    output: &Path,
+    start_us: i64,
+    end_us: i64,
+    channels: &[usize],
+    source_ordinals: &[usize],
+) -> Result<Value, MediaError> {
     let duration = end_us
         .checked_sub(start_us)
         .filter(|v| *v > 0)
@@ -190,7 +223,7 @@ pub(crate) fn audio(
                     start_us: start_us.checked_add(offset).ok_or_else(failed)?,
                     end_us: start_us.checked_add(end).ok_or_else(failed)?,
                     samples,
-                    track,
+                    track: source_ordinals[track],
                 },
             )?;
             let after = pcm(

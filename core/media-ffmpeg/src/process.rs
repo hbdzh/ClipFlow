@@ -12,6 +12,7 @@ pub(crate) struct Context<'a> {
     pub config: &'a BackendConfig,
     pub cancel: &'a AtomicBool,
     deadline: Instant,
+    pub media_file_budget: Option<u64>,
 }
 
 impl<'a> Context<'a> {
@@ -24,10 +25,18 @@ impl<'a> Context<'a> {
         cancel: &'a AtomicBool,
         timeout_ms: u64,
     ) -> Self {
+        Self::with_budget(config, cancel, Duration::from_millis(timeout_ms))
+    }
+    pub fn with_budget(
+        config: &'a BackendConfig,
+        cancel: &'a AtomicBool,
+        budget: Duration,
+    ) -> Self {
         Self {
             config,
             cancel,
-            deadline: Instant::now() + Duration::from_millis(timeout_ms),
+            media_file_budget: None,
+            deadline: Instant::now() + budget,
         }
     }
 
@@ -48,9 +57,27 @@ impl<'a> Context<'a> {
     }
 
     pub fn run(&self, program: &Path, args: &[OsString]) -> Result<Vec<u8>, MediaError> {
+        self.run_checked(program, args, None)
+    }
+    pub fn run_media(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        path: &Path,
+        budget: u64,
+    ) -> Result<Vec<u8>, MediaError> {
+        self.run_checked(program, args, Some((path, budget)))
+    }
+    fn run_checked(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        file: Option<(&Path, u64)>,
+    ) -> Result<Vec<u8>, MediaError> {
         self.check()?;
         let child = Command::new(program)
             .args(args)
+            .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -118,6 +145,12 @@ impl<'a> Context<'a> {
             if let Err(error) = self.check() {
                 break Err(error);
             }
+            if file.is_some_and(|(p, n)| std::fs::metadata(p).is_ok_and(|m| m.len() > n)) {
+                break Err(MediaError::new(
+                    "RESOURCE_LIMIT",
+                    "Encoded media exceeded its file budget.",
+                ));
+            }
             if exceeded.load(Ordering::Acquire) {
                 break Err(MediaError::new(
                     "RESOURCE_LIMIT",
@@ -160,6 +193,12 @@ impl<'a> Context<'a> {
             .map_err(|_| MediaError::new("PROCESS_FAILED", "Media diagnostic reader failed."))?
             .map_err(|_| MediaError::new("PROCESS_FAILED", "Media diagnostic cannot be read."))?;
         let status = status?;
+        if file.is_some_and(|(p, n)| std::fs::metadata(p).is_ok_and(|m| m.len() > n)) {
+            return Err(MediaError::new(
+                "RESOURCE_LIMIT",
+                "Encoded media exceeded its file budget.",
+            ));
+        }
         self.check()?;
         if exceeded.load(Ordering::Acquire) {
             return Err(MediaError::new(
@@ -260,6 +299,8 @@ mod tests {
             timeout_ms,
             accurate_reencode_timeout_ms: timeout_ms,
             core003_enabled: false,
+            core004_enabled: false,
+            transcode_timeout_ms: 600000,
             max_output_bytes,
         }
     }
@@ -277,6 +318,23 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
+    #[test]
+    fn encoded_file_budget_is_checked_even_when_child_exits_immediately() {
+        let path =
+            std::env::temp_dir().join(format!("mediastudio-budget-{}.bin", std::process::id()));
+        let config = config(2000, 1024);
+        let flag = AtomicBool::new(false);
+        let context = Context::new(&config, &flag);
+        let command = args(&[
+            "if=/dev/zero",
+            &format!("of={}", path.display()),
+            "bs=1024",
+            "count=1",
+        ]);
+        let result = context.run_media(Path::new("/bin/dd"), &command, &path, 512);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(result.expect_err("file size budget").code, "RESOURCE_LIMIT");
+    }
     #[test]
     fn endless_output_is_killed_instead_of_filling_pipes() {
         let config = config(2000, 1024);

@@ -1,0 +1,15 @@
+{
+  "schema_version": 0,
+  "operation": "transcode",
+  "source": {
+    "uri": "file:///EXAMPLE/source.mp4"
+  },
+  "destination": {
+    "uri": "file:///EXAMPLE/output.mp4"
+  },
+  "profile": "mp4_h264_720p_v1",
+  "audio_selection": {
+    "mode": "one",
+    "stream_index": 2
+  }
+}

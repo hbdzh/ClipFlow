@@ -6,12 +6,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::Path;
 
+#[derive(Clone)]
 pub(crate) struct Frame {
     pub pts: i64,
     pub duration: i64,
     pub key: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct Media {
     pub info: Value,
     pub streams: Vec<Value>,

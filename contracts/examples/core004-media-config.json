@@ -1,0 +1,13 @@
+{
+  "schema_version": 0,
+  "media_backend": {
+    "ffmpeg": "/EXAMPLE/ffmpeg",
+    "ffprobe": "/EXAMPLE/ffprobe",
+    "core003_enabled": true,
+    "core004_enabled": true,
+    "timeout_ms": 30000,
+    "accurate_reencode_timeout_ms": 600000,
+    "transcode_timeout_ms": 600000,
+    "max_output_bytes": 8388608
+  }
+}
