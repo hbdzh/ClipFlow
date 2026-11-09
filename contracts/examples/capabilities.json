@@ -1,0 +1,12 @@
+{
+  "schema_version": 0,
+  "core_version": "0.0.0-draft",
+  "platform": "example-platform",
+  "features": {
+    "probe": {"available": true},
+    "trim_stream_copy": {"available": true},
+    "accurate_reencode": {"available": false, "reason": "not_implemented"},
+    "ai_separation": {"available": false, "reason": "backend_not_installed"}
+  },
+  "media_backend": {"name": "ffmpeg", "version": "example-only"}
+}
