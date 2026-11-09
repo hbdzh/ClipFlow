@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use media_domain::{CoreError, file_uri};
+use media_domain::{
+    ACCURATE_REENCODE_PROFILE, CoreError, STREAM_COPY_V1_PROFILE, TrimStrategy, file_uri,
+};
 use media_orchestrator::Engine;
 use serde_json::{Value, json};
 
@@ -15,21 +17,31 @@ fn command(args: &[String]) -> Result<(Value, bool), CoreError> {
         [command] if command == "version" => Ok((engine.version(), true)),
         [command] if command == "capabilities" => Ok((engine.capabilities(), true)),
         [command, flag] if command == "capabilities" && flag == "--media" => {
-            let engine = Engine::new(&media_config()?)?;
+            let engine = Engine::new(&media_config(false, false)?)?;
+            Ok((engine.capabilities(), true))
+        }
+        [command, flag] if command == "capabilities" && flag == "--core003" => {
+            let engine = Engine::new(&media_config(true, true)?)?;
             Ok((engine.capabilities(), true))
         }
         [command, source] if command == "probe" => media_job(probe_request(source)?, None),
         [command, source, flag, delay] if command == "probe" && flag == "--cancel-after-ms" => {
             media_job(probe_request(source)?, Some(parse_delay(delay)?))
         }
-        [command, source, destination, start, end] if command == "trim" => {
-            media_job(trim_request(source, destination, start, end)?, None)
-        }
-        [command, source, destination, start, end, flag, delay]
-            if command == "trim" && flag == "--cancel-after-ms" =>
+        [command, source, destination, start, end]
+            if matches!(command.as_str(), "trim" | "trim-accurate" | "trim-copy-v1") =>
         {
             media_job(
-                trim_request(source, destination, start, end)?,
+                trim_request(source, destination, start, end, trim_strategy(command)?)?,
+                None,
+            )
+        }
+        [command, source, destination, start, end, flag, delay]
+            if matches!(command.as_str(), "trim" | "trim-accurate" | "trim-copy-v1")
+                && flag == "--cancel-after-ms" =>
+        {
+            media_job(
+                trim_request(source, destination, start, end, trim_strategy(command)?)?,
                 Some(parse_delay(delay)?),
             )
         }
@@ -73,7 +85,7 @@ fn executable(variable: &str, name: &str) -> Result<PathBuf, CoreError> {
     Err(CoreError::UnsupportedOperation)
 }
 
-fn media_config() -> Result<Vec<u8>, CoreError> {
+fn media_config(core003_enabled: bool, accurate_deadline: bool) -> Result<Vec<u8>, CoreError> {
     let ffmpeg = executable("MEDIASTUDIO_FFMPEG", "ffmpeg")?;
     let ffprobe = executable("MEDIASTUDIO_FFPROBE", "ffprobe")?;
     let setting = |name: &str, default: u64| -> Result<u64, CoreError> {
@@ -83,12 +95,19 @@ fn media_config() -> Result<Vec<u8>, CoreError> {
             Err(_) => Err(CoreError::InvalidUtf8),
         }
     };
-    let config = json!({"schema_version":0,"media_backend":{
+    let mut config = json!({"schema_version":0,"media_backend":{
         "ffmpeg":ffmpeg.to_str().ok_or(CoreError::InvalidUtf8)?,
         "ffprobe":ffprobe.to_str().ok_or(CoreError::InvalidUtf8)?,
         "timeout_ms":setting("MEDIASTUDIO_TIMEOUT_MS",30_000)?,
         "max_output_bytes":setting("MEDIASTUDIO_MAX_OUTPUT_BYTES",8*1024*1024)?
     }});
+    if core003_enabled {
+        config["media_backend"]["core003_enabled"] = json!(true);
+    }
+    if accurate_deadline {
+        config["media_backend"]["accurate_reencode_timeout_ms"] =
+            json!(setting("MEDIASTUDIO_ACCURATE_TIMEOUT_MS", 600_000)?);
+    }
     serde_json::to_vec(&config).map_err(|_| CoreError::Internal)
 }
 
@@ -98,22 +117,39 @@ fn probe_request(source: &str) -> Result<Value, CoreError> {
     )
 }
 
+fn trim_strategy(command: &str) -> Result<TrimStrategy, CoreError> {
+    match command {
+        "trim" => Ok(TrimStrategy::StreamCopy),
+        "trim-copy-v1" => Ok(TrimStrategy::StreamCopyV1),
+        "trim-accurate" => Ok(TrimStrategy::AccurateReencode),
+        _ => Err(CoreError::UnsupportedOperation),
+    }
+}
+
 fn trim_request(
     source: &str,
     destination: &str,
     start: &str,
     end: &str,
+    strategy: TrimStrategy,
 ) -> Result<Value, CoreError> {
     let start_us: i64 = start.parse().map_err(|_| CoreError::InvalidArgument)?;
     let end_us: i64 = end.parse().map_err(|_| CoreError::InvalidArgument)?;
     if start_us < 0 || end_us <= start_us {
         return Err(CoreError::InvalidArgument);
     }
-    Ok(
-        json!({"schema_version":0,"operation":"trim", "source":{"uri":file_uri(&absolute_path(source)?)?},
+    let mut request = json!({"schema_version":0,"operation":"trim", "source":{"uri":file_uri(&absolute_path(source)?)?},
         "destination":{"uri":file_uri(&absolute_path(destination)?)?},"range":{"start_us":start_us,"end_us":end_us},
-        "strategy":"stream_copy","stream_selection":"all_supported","allow_reencode_fallback":false}),
-    )
+        "strategy":"stream_copy","stream_selection":"all_supported","allow_reencode_fallback":false});
+    match strategy {
+        TrimStrategy::StreamCopy => {}
+        TrimStrategy::StreamCopyV1 => request["profile"] = json!(STREAM_COPY_V1_PROFILE),
+        TrimStrategy::AccurateReencode => {
+            request["strategy"] = json!("accurate_reencode");
+            request["profile"] = json!(ACCURATE_REENCODE_PROFILE);
+        }
+    }
+    Ok(request)
 }
 
 fn parse_delay(text: &str) -> Result<u64, CoreError> {
@@ -125,10 +161,17 @@ fn parse_delay(text: &str) -> Result<u64, CoreError> {
 }
 
 fn media_job(request: Value, cancel_after_ms: Option<u64>) -> Result<(Value, bool), CoreError> {
-    let config = media_config()?;
+    let accurate = request["strategy"] == "accurate_reencode";
+    let core003 = accurate || request["profile"] == STREAM_COPY_V1_PROFILE;
+    let config = media_config(core003, accurate)?;
     let mut engine = Engine::new(&config)?;
     let config_value: Value = serde_json::from_slice(&config).map_err(|_| CoreError::Internal)?;
-    let timeout_ms = config_value["media_backend"]["timeout_ms"]
+    let timeout_key = if accurate {
+        "accurate_reencode_timeout_ms"
+    } else {
+        "timeout_ms"
+    };
+    let timeout_ms = config_value["media_backend"][timeout_key]
         .as_u64()
         .ok_or(CoreError::Internal)?;
     let submitted = engine.submit(request.to_string().as_bytes())?;
@@ -217,7 +260,7 @@ fn main() -> ExitCode {
     let (value, success) = match output {
         Ok(output) => output,
         Err(error) => (
-            json!({"schema_version":0,"mock_only":true,"error":{"code":error.code(),"message":"Unsupported or invalid CLI request. Use version, capabilities [--media], mock, probe PATH, or trim SOURCE DEST START_US END_US [--cancel-after-ms N]."}}),
+            json!({"schema_version":0,"mock_only":true,"error":{"code":error.code(),"message":"Unsupported or invalid CLI request. Use version, capabilities [--media|--core003], mock, probe PATH, or trim|trim-accurate|trim-copy-v1 SOURCE DEST START_US END_US [--cancel-after-ms N]."}}),
             false,
         ),
     };

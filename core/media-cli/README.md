@@ -9,22 +9,34 @@ cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- mock succeed
 cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- capabilities --media
 cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- probe /absolute/source.mp4
 cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- trim /absolute/source.mp4 /absolute/output.mp4 1100000 2600000
+cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- capabilities --core003
+cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- trim-copy-v1 /absolute/source.mp4 /absolute/copy.mp4 1100000 2600000
+cargo run --manifest-path core/Cargo.toml --locked -p media-cli -- trim-accurate /absolute/source.mp4 /absolute/accurate.mp4 1100000 2600000
 ```
 
-`version`、默认 `capabilities` 和 `mock` 保持 CORE-001 的 mock 语义。`probe`、`trim` 和 `capabilities --media` 显式启用真实后端；它们从 `PATH` 查找 `ffmpeg` 和 `ffprobe`，也可设置以下环境变量。工具必须由调用方安装，本仓库不携带 FFmpeg 二进制。
+`version`、默认 `capabilities` 和 `mock` 保持 CORE-001 的 mock 语义。`probe`、`trim` 和 `capabilities --media` 显式启用CORE-002兼容真实后端；它们从 `PATH` 查找 `ffmpeg` 和 `ffprobe`，也可设置以下环境变量。工具必须由调用方安装，本仓库不携带 FFmpeg 二进制。
 
 | 环境变量 | 默认值或约束 |
 | --- | --- |
 | `MEDIASTUDIO_FFMPEG` | FFmpeg 可执行文件的绝对路径；未设置时查找 `PATH` |
 | `MEDIASTUDIO_FFPROBE` | FFprobe 可执行文件的绝对路径；未设置时查找 `PATH` |
-| `MEDIASTUDIO_TIMEOUT_MS` | `30000`；允许 `1..300000` |
+| `MEDIASTUDIO_TIMEOUT_MS` | `30000`；允许 `1..300000`，用于probe、流复制及能力检测 |
+| `MEDIASTUDIO_ACCURATE_TIMEOUT_MS` | `600000`；允许 `1..7200000`，仅`trim-accurate` / `capabilities --core003`读取 |
 | `MEDIASTUDIO_MAX_OUTPUT_BYTES` | `8388608`；允许 `1024..67108864` |
 
 输入和输出路径可使用相对路径；CLI 依据当前目录转为绝对本地文件 URI，并正确编码 UTF-8、空格和特殊字符。参数通过参数数组交给后端，不经过 shell。路径必须为 UTF-8。目的文件不得已存在，后端不会覆盖源文件或已有目的文件。
 
-`START_US`、`END_US` 是相对于规范化媒体时间线的整数微秒，须满足 `0 <= START_US < END_US`。当前只请求 `stream_copy`、`all_supported`，不允许回退重编码。实际保留范围受完整关键帧 GOP 限制，必须查看结果中的 `requested_range_us` 和 `actual_range_us`，不能把它当作任意帧精确剪辑。
+`START_US`、`END_US` 是相对于规范化媒体时间线的整数微秒，须满足 `0 <= START_US < END_US`。旧`trim`只请求不带profile的`stream_copy`、`all_supported`，不允许回退重编码；其旧颜色限制不变。实际保留范围受完整关键帧 GOP 限制，必须查看结果中的 `requested_range_us` 和 `actual_range_us`，不能把它当作任意帧精确剪辑。
 
-`probe` 和 `trim` 可在末尾追加 `--cancel-after-ms N`，其中 `0 <= N <= 300000`。这是验证取消的客户端选项；若导出已提交，迟到的取消仍可能得到 `succeeded`。
+`probe`、`trim`、`trim-copy-v1` 和 `trim-accurate` 可在末尾追加 `--cancel-after-ms N`，其中 `0 <= N <= 300000`。这是验证取消的客户端选项；若导出已提交，迟到的取消仍可能得到 `succeeded`。
+
+## CORE-003显式命令
+
+`trim-copy-v1`固定请求`stream_copy` + `mp4_h264_copy_v1`；`trim-accurate`固定请求`accurate_reencode` + `mp4_h264_standard_v1`。两者自动在宿主配置启用`core003_enabled:true`，不改变公共操作名`trim`，仍只保留全部支持音轨，不接受codec/CRF/filter或任意FFmpeg参数。新profile范围与输出验证见[CORE-003契约](../../contracts/CORE-003.md)；能力不足或输入不支持仍明确失败，不静默换模式。
+
+`capabilities --core003`显式检查新profile与软件编码能力；默认capabilities为mock，旧`capabilities --media`不启用新能力，不会因为FFmpeg存在就宣称准确可用。旧命令与`trim-copy-v1`不读取新准确期限环境变量；无效的`MEDIASTUDIO_ACCURATE_TIMEOUT_MS`不会改变它们的行为。
+
+精确命令明确有损重编码，不能称“精确无损”。它保留请求范围与实际选帧范围，源帧起点按有理时间基量化，音频/视频共同归零；准确deadline从处理开始覆盖分析、编码和验证，不含排队，CLI的防御等待使用该准确值加既有清理余量。现有每engine一个worker和关闭/取消所有权不变。
 
 CLI 向 stdout 输出一份 JSON，其中 `snapshots` 保存观察到的不同快照，`final` 是终态。真实任务只有 `succeeded` 返回退出码 0，`failed`、`cancelled` 和无效请求均返回非 0。失败详情位于 `final.error.code` 和 `final.error.message`；真实失败另带顶层数值 `error.code = -100`，作为旧 CLI 调用方兼容标记。默认 mock 的取消退出码仍为 0。
 

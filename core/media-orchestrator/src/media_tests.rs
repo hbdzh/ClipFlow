@@ -135,3 +135,46 @@ fn cancellation_losing_to_completed_commit_does_not_hide_created_file() {
         true
     );
 }
+
+#[test]
+fn core003_validated_request_and_deadline_reach_the_same_worker_without_ghost_jobs() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let executor: Executor = Arc::new(move |config, request, _| {
+        assert!(config.core003_enabled);
+        assert_eq!(config.timeout_ms, 30_000);
+        assert_eq!(config.accurate_reencode_timeout_ms, 123_456);
+        assert!(matches!(
+            request,
+            MediaRequest::Trim {
+                strategy: media_domain::TrimStrategy::AccurateReencode,
+                start_us: 1_100_000,
+                end_us: 2_600_000,
+                ..
+            }
+        ));
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(
+            json!({"schema_version":0,"mock_only":false,"file_created":false,"controlled_executor":true}),
+        )
+    });
+    let config = br#"{"schema_version":0,"media_backend":{"ffmpeg":"/test/ffmpeg","ffprobe":"/test/ffprobe","core003_enabled":true,"accurate_reencode_timeout_ms":123456}}"#;
+    let mut engine = Engine::with_executor(config, executor).unwrap();
+    let mut request = json!({"schema_version":0,"operation":"trim","source":{"uri":"file:///test/input.mp4"},
+        "destination":{"uri":"file:///test/output.mp4"},"range":{"start_us":1100000,"end_us":2600000},
+        "strategy":"accurate_reencode","stream_selection":"all_supported","allow_reencode_fallback":false});
+    assert_eq!(
+        engine.submit(request.to_string().as_bytes()).unwrap_err(),
+        CoreError::InvalidArgument
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!engine.has_active_jobs());
+    request["profile"] = json!("mp4_h264_standard_v1");
+    let submitted = engine.submit(request.to_string().as_bytes()).unwrap();
+    assert_eq!(submitted["job_id"], "media-1");
+    let id = submitted["job_id"].as_str().unwrap().to_owned();
+    wait_for(|| engine.snapshot(&id).unwrap()["state"] == "succeeded");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.snapshot(&id).unwrap()["operation"], "trim");
+    assert!(!engine.has_active_jobs());
+}

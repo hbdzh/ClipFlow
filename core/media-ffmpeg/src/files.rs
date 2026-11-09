@@ -6,6 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+fn creation_error(error: &std::io::Error, message: &'static str) -> MediaError {
+    // Accepted backend is macOS, where ENOSPC is 28. Unknown platforms retain
+    // the conservative fallback rather than claiming portable errno semantics.
+    if cfg!(target_os = "macos") && error.raw_os_error() == Some(28) {
+        MediaError::new("OUT_OF_DISK", "Output storage is full.")
+    } else {
+        MediaError::new("PERMISSION_DENIED", message)
+    }
+}
+
 pub(crate) struct Source {
     pub path: PathBuf,
     metadata: Metadata,
@@ -144,9 +154,9 @@ impl Temporary {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => {
-                    return Err(MediaError::new(
-                        "PERMISSION_DENIED",
+                Err(error) => {
+                    return Err(creation_error(
+                        &error,
                         "A private output directory cannot be created.",
                     ));
                 }
@@ -201,8 +211,8 @@ impl Temporary {
                     "Destination appeared during export and was not replaced.",
                 )
             } else {
-                MediaError::new(
-                    "PERMISSION_DENIED",
+                creation_error(
+                    &error,
                     "Validated output cannot be committed without overwriting.",
                 )
             }
@@ -232,6 +242,21 @@ impl Drop for Temporary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_disk_full_creation_error_is_not_reported_as_permission_denied() {
+        let error = std::io::Error::from_raw_os_error(28);
+        assert_eq!(
+            creation_error(&error, "fallback").code,
+            if cfg!(target_os = "macos") {
+                "OUT_OF_DISK"
+            } else {
+                "PERMISSION_DENIED"
+            }
+        );
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(creation_error(&error, "fallback").code, "PERMISSION_DENIED");
+    }
 
     #[test]
     fn destination_does_not_replace_existing_source_or_outputs() {

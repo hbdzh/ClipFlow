@@ -1,0 +1,18 @@
+{
+  "schema_version": 0,
+  "operation": "trim",
+  "source": {
+    "uri": "file:///EXAMPLE/source.mp4"
+  },
+  "destination": {
+    "uri": "file:///EXAMPLE/accurate-new.mp4"
+  },
+  "range": {
+    "start_us": 1100000,
+    "end_us": 2600000
+  },
+  "strategy": "accurate_reencode",
+  "profile": "mp4_h264_standard_v1",
+  "stream_selection": "all_supported",
+  "allow_reencode_fallback": false
+}

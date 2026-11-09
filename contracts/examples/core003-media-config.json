@@ -1,0 +1,12 @@
+{
+  "schema_version": 0,
+  "max_jobs": 64,
+  "media_backend": {
+    "ffmpeg": "/EXAMPLE/ffmpeg",
+    "ffprobe": "/EXAMPLE/ffprobe",
+    "timeout_ms": 30000,
+    "max_output_bytes": 8388608,
+    "core003_enabled": true,
+    "accurate_reencode_timeout_ms": 600000
+  }
+}

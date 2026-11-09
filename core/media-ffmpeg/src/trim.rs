@@ -192,8 +192,13 @@ pub(crate) fn execute(
     mut media: Media,
     start_us: i64,
     end_us: i64,
+    extended: bool,
 ) -> Result<Value, MediaError> {
-    supported(&media)?;
+    if extended {
+        crate::scope::supported(&media)?;
+    } else {
+        supported(&media)?;
+    }
     let destination = files::destination(source, destination)?;
     media.packets = media::packet_info(context, &source.path)?;
     let plan = plan(&media, start_us, end_us)?;
@@ -245,9 +250,52 @@ pub(crate) fn execute(
                 "-f",
                 "mp4",
             ]));
+            if extended {
+                // Global metadata stripping can also suppress implicit stream
+                // tag copying. The opt-in profile explicitly preserves each
+                // stream's validated language, in mapped stream order.
+                for (ordinal, stream) in media.streams.iter().enumerate() {
+                    if let Some(language) = stream["language"].as_str() {
+                        command.extend(args(&[
+                            &format!("-metadata:s:{ordinal}"),
+                            &format!("language={language}"),
+                        ]));
+                    }
+                }
+            }
             command.push(temporary.path.as_os_str().to_owned());
             context.run(&context.config.ffmpeg, &command)?;
             let output = media::inspect(context, &temporary.path)?;
+            if extended {
+                crate::scope::supported(&output).map_err(|_| {
+                    MediaError::new(
+                        "OUTPUT_VALIDATION_FAILED",
+                        "Stream-copy output changed its accepted CORE-003 scope.",
+                    )
+                })?;
+                for (before, after) in media.streams.iter().zip(&output.streams) {
+                    for key in [
+                        "width",
+                        "height",
+                        "pix_fmt",
+                        "sample_aspect_ratio",
+                        "color_range",
+                        "color_space",
+                        "color_transfer",
+                        "color_primaries",
+                        "channels",
+                        "sample_rate",
+                        "profile",
+                    ] {
+                        if before[key] != after[key] {
+                            return Err(MediaError::new(
+                                "OUTPUT_VALIDATION_FAILED",
+                                "Stream-copy output metadata changed.",
+                            ));
+                        }
+                    }
+                }
+            }
             let source_layout = media
                 .streams
                 .iter()
@@ -277,7 +325,7 @@ pub(crate) fn execute(
             )?;
             media::full_decode(context, &temporary.path)?;
             let av_delta = av_end_delta(&output.streams, &output_packets)?;
-            let result = json!({
+            let mut result = json!({
                 "schema_version": 0,"mock_only":false,"file_created":true,
                 "requested_range_us":{"start_us":start_us,"end_us":end_us},
                 "actual_range_us":{"start_us":plan.start_us-media.origin_us,"end_us":plan.end_us-media.origin_us},
@@ -294,6 +342,13 @@ pub(crate) fn execute(
                     "all_stream_packet_sequences_contiguous":true,"source_relative_packet_timestamps":true,"packet_timestamp_tolerance_us":2000,
                     "audio_video_end_difference_us":av_delta,"perceptual_av_sync_verified":false,"source_identity_unchanged":true}
             });
+            if extended {
+                result["strategy"] = json!("stream_copy");
+                result["profile"] = json!("mp4_h264_copy_v1");
+                result["reencoded"] = json!(false);
+                result["lossless"] = json!(true);
+                result["validation"]["core003_scope_verified"] = json!(true);
+            }
             let serialized = serde_json::to_vec(&result)
                 .map_err(|_| MediaError::new("INTERNAL", "Result cannot be serialized."))?;
             if serialized.len() > MAX_MEDIA_RESULT_BYTES {

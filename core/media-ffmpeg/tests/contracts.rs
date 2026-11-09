@@ -7,6 +7,8 @@ fn missing_backend() -> BackendConfig {
         ffmpeg: PathBuf::from("/definitely-missing-media-core/ffmpeg"),
         ffprobe: PathBuf::from("/definitely-missing-media-core/ffprobe"),
         timeout_ms: 100,
+        accurate_reencode_timeout_ms: 600_000,
+        core003_enabled: false,
         max_output_bytes: 1024,
     }
 }
