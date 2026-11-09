@@ -59,7 +59,20 @@ pub struct BackendConfig {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub timeout_ms: u64,
+    pub accurate_reencode_timeout_ms: u64,
+    pub core003_enabled: bool,
     pub max_output_bytes: usize,
+}
+
+pub const ACCURATE_REENCODE_PROFILE: &str = "mp4_h264_standard_v1";
+pub const STREAM_COPY_V1_PROFILE: &str = "mp4_h264_copy_v1";
+
+/// Validated strategy, never a caller-supplied codec/filter argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrimStrategy {
+    StreamCopy,
+    StreamCopyV1,
+    AccurateReencode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +85,7 @@ pub enum MediaRequest {
         destination: PathBuf,
         start_us: i64,
         end_us: i64,
+        strategy: TrimStrategy,
     },
 }
 
@@ -164,7 +178,14 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
     let map = value.as_object().ok_or(CoreError::InvalidArgument)?;
     allowed_fields(
         map,
-        &["ffmpeg", "ffprobe", "timeout_ms", "max_output_bytes"],
+        &[
+            "ffmpeg",
+            "ffprobe",
+            "timeout_ms",
+            "accurate_reencode_timeout_ms",
+            "core003_enabled",
+            "max_output_bytes",
+        ],
     )?;
     let executable = |name: &str| -> Result<PathBuf, CoreError> {
         let text = map
@@ -185,7 +206,16 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         None => 8 * 1024 * 1024,
         Some(value) => value.as_u64().ok_or(CoreError::InvalidArgument)?,
     };
+    let accurate_reencode_timeout_ms = match map.get("accurate_reencode_timeout_ms") {
+        None => 600_000,
+        Some(value) => value.as_u64().ok_or(CoreError::InvalidArgument)?,
+    };
+    let core003_enabled = match map.get("core003_enabled") {
+        None => false,
+        Some(value) => value.as_bool().ok_or(CoreError::InvalidArgument)?,
+    };
     if !(1..=300_000).contains(&timeout_ms)
+        || !(1..=7_200_000).contains(&accurate_reencode_timeout_ms)
         || !(1024..=64 * 1024 * 1024).contains(&max_output_bytes)
     {
         return Err(CoreError::InvalidArgument);
@@ -194,6 +224,8 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         ffmpeg: executable("ffmpeg")?,
         ffprobe: executable("ffprobe")?,
         timeout_ms,
+        accurate_reencode_timeout_ms,
+        core003_enabled,
         max_output_bytes: max_output_bytes as usize,
     })
 }
@@ -282,16 +314,32 @@ pub fn parse_request(input: &[u8]) -> Result<Request, CoreError> {
                     "destination",
                     "range",
                     "strategy",
+                    "profile",
                     "stream_selection",
                     "allow_reencode_fallback",
                 ],
             )?;
-            if map.get("strategy").and_then(Value::as_str) != Some("stream_copy")
-                || map.get("stream_selection").and_then(Value::as_str) != Some("all_supported")
+            if map.get("stream_selection").and_then(Value::as_str) != Some("all_supported")
                 || map.get("allow_reencode_fallback").and_then(Value::as_bool) != Some(false)
             {
                 return Err(CoreError::InvalidArgument);
             }
+            let strategy = match map.get("strategy").and_then(Value::as_str) {
+                Some("stream_copy") => match map.get("profile") {
+                    None => TrimStrategy::StreamCopy,
+                    Some(Value::String(profile)) if profile == STREAM_COPY_V1_PROFILE => {
+                        TrimStrategy::StreamCopyV1
+                    }
+                    _ => return Err(CoreError::InvalidArgument),
+                },
+                Some("accurate_reencode")
+                    if map.get("profile").and_then(Value::as_str)
+                        == Some(ACCURATE_REENCODE_PROFILE) =>
+                {
+                    TrimStrategy::AccurateReencode
+                }
+                _ => return Err(CoreError::InvalidArgument),
+            };
             let range = map
                 .get("range")
                 .and_then(Value::as_object)
@@ -313,6 +361,7 @@ pub fn parse_request(input: &[u8]) -> Result<Request, CoreError> {
                 destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
                 start_us,
                 end_us,
+                strategy,
             }))
         }
         _ => Err(CoreError::UnsupportedOperation),

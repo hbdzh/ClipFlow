@@ -22,6 +22,7 @@ pub(crate) struct Media {
     pub origin_us: i64,
     pub duration_us: i64,
     pub trim_display_metadata_supported: bool,
+    pub core003_display_metadata_supported: bool,
 }
 
 fn invalid() -> MediaError {
@@ -95,6 +96,10 @@ pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, Media
             "index",
             "codec_type",
             "codec_name",
+            "profile",
+            "r_frame_rate",
+            "avg_frame_rate",
+            "field_order",
             "time_base",
             "start_pts",
             "duration_ts",
@@ -156,6 +161,27 @@ pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, Media
                 .as_str()
                 .is_none_or(|value| matches!(value, "unknown" | "unspecified"))
         });
+    let no_display_side_data = video["tags"].get("rotate").is_none()
+        && video["side_data_list"]
+            .as_array()
+            .is_none_or(|data| data.is_empty());
+    let no_colour = [
+        "color_range",
+        "color_space",
+        "color_transfer",
+        "color_primaries",
+    ]
+    .iter()
+    .all(|key| {
+        video[*key]
+            .as_str()
+            .is_none_or(|v| matches!(v, "unknown" | "unspecified"))
+    });
+    let bt709 = video["color_range"] == "tv"
+        && video["color_space"] == "bt709"
+        && video["color_transfer"] == "bt709"
+        && video["color_primaries"] == "bt709";
+    let core003_display_metadata_supported = no_display_side_data && (no_colour || bt709);
     let video_index = integer(&video["index"])?;
     let time_base = Rational::parse(video["time_base"].as_str().ok_or_else(invalid)?)?;
     let raw_frames = probe_json(
@@ -212,6 +238,7 @@ pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, Media
         "raw_format_start_time": raw["format"]["start_time"].as_str(),
         "video_frame_count": frames.len(),
         "trim_display_metadata_supported":trim_display_metadata_supported,
+        "core003_display_metadata_supported":core003_display_metadata_supported,
         "streams": streams,
         "limits": {"maximum_streams":16,"maximum_frames":100000,"input_protocol":"file","demuxer":"mov"}
     });
@@ -225,6 +252,7 @@ pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, Media
         origin_us,
         duration_us,
         trim_display_metadata_supported,
+        core003_display_metadata_supported,
     })
 }
 
@@ -256,6 +284,77 @@ pub(crate) fn packet_info(context: &Context<'_>, path: &Path) -> Result<Vec<Valu
         }
     }
     Ok(packets)
+}
+
+/// Reencoding changes compressed payloads; only decode-order metadata is needed
+/// here. Compact records avoid filling the bounded pipe with unused SHA hashes.
+pub(crate) fn validate_decode_order(
+    context: &Context<'_>,
+    path: &Path,
+    streams: &[Value],
+) -> Result<usize, MediaError> {
+    let mut command = args(&[
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        "mov",
+        "-enable_drefs",
+        "0",
+        "-use_absolute_path",
+        "0",
+        "-show_packets",
+        "-show_entries",
+        "packet=stream_index,dts",
+        "-of",
+        "compact=p=0:nk=0",
+    ]);
+    command.push(path.as_os_str().to_owned());
+    let output = context.run(&context.config.ffprobe, &command)?;
+    let text = std::str::from_utf8(&output).map_err(|_| invalid())?;
+    let expected = streams
+        .iter()
+        .map(|s| integer(&s["index"]))
+        .collect::<Result<Vec<_>, _>>()?;
+    decode_order_text(text, &expected)
+}
+
+fn decode_order_text(text: &str, streams: &[i64]) -> Result<usize, MediaError> {
+    let failed = || {
+        MediaError::new(
+            "OUTPUT_VALIDATION_FAILED",
+            "Output packet decode timestamps are missing or not increasing per stream.",
+        )
+    };
+    let mut last = BTreeMap::new();
+    let mut count = 0_usize;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let fields = line
+            .split('|')
+            .filter_map(|v| v.split_once('='))
+            .collect::<BTreeMap<_, _>>();
+        let index = fields
+            .get("stream_index")
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(failed)?;
+        let dts = fields
+            .get("dts")
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(failed)?;
+        if !streams.contains(&index)
+            || last
+                .insert(index, dts)
+                .is_some_and(|previous| previous >= dts)
+        {
+            return Err(failed());
+        }
+        count = count.checked_add(1).ok_or_else(failed)?;
+    }
+    if streams.iter().any(|s| !last.contains_key(s)) {
+        return Err(failed());
+    }
+    Ok(count)
 }
 
 pub(crate) fn frame_hashes(context: &Context<'_>, path: &Path) -> Result<Vec<String>, MediaError> {
@@ -483,6 +582,22 @@ pub(crate) fn full_decode(context: &Context<'_>, path: &Path) -> Result<(), Medi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_decode_order_rejects_duplicate_missing_and_unknown_streams() {
+        assert_eq!(
+            decode_order_text(
+                "stream_index=0|dts=-2\nstream_index=1|dts=-1024\nstream_index=0|dts=0\n",
+                &[0, 1]
+            )
+            .expect("valid DTS"),
+            3
+        );
+        assert!(decode_order_text("stream_index=0|dts=0\nstream_index=0|dts=0\n", &[0]).is_err());
+        assert!(decode_order_text("stream_index=0|dts=0\n", &[0, 1]).is_err());
+        assert!(decode_order_text("stream_index=4|dts=0\n", &[0]).is_err());
+        assert!(decode_order_text("stream_index=0|dts=N/A\n", &[0]).is_err());
+    }
 
     #[test]
     fn continuity_rejects_decodable_b_frame_holes() {

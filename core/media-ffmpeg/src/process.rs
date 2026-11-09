@@ -16,10 +16,18 @@ pub(crate) struct Context<'a> {
 
 impl<'a> Context<'a> {
     pub fn new(config: &'a BackendConfig, cancel: &'a AtomicBool) -> Self {
+        Self::with_timeout(config, cancel, config.timeout_ms)
+    }
+
+    pub fn with_timeout(
+        config: &'a BackendConfig,
+        cancel: &'a AtomicBool,
+        timeout_ms: u64,
+    ) -> Self {
         Self {
             config,
             cancel,
-            deadline: Instant::now() + Duration::from_millis(config.timeout_ms),
+            deadline: Instant::now() + Duration::from_millis(timeout_ms),
         }
     }
 
@@ -145,7 +153,7 @@ impl<'a> Context<'a> {
             })?
             .map_err(|_| MediaError::new("PROCESS_FAILED", "Media output reader failed."))?
             .map_err(|_| MediaError::new("PROCESS_FAILED", "Media output cannot be read."))?;
-        let _diagnostic = diagnostic
+        let diagnostic = diagnostic
             .ok_or_else(|| {
                 MediaError::new("PROCESS_FAILED", "Media diagnostic reader is unavailable.")
             })?
@@ -160,6 +168,17 @@ impl<'a> Context<'a> {
             ));
         }
         if !status.success() {
+            // FFmpeg 7 propagates AVERROR(ENOSPC) as process status 228. Require
+            // both the exact status and its diagnostic, not a path substring.
+            if status.code() == Some(228)
+                && std::str::from_utf8(&diagnostic)
+                    .is_ok_and(|s| s.contains("No space left on device"))
+            {
+                return Err(MediaError::new(
+                    "OUT_OF_DISK",
+                    "Media output storage is full.",
+                ));
+            }
             // Child diagnostics can include private source paths; never echo them
             // into public job errors. Tests independently preserve command evidence.
             return Err(MediaError::new(
@@ -239,6 +258,8 @@ mod tests {
             ffmpeg: PathBuf::from("/bin/sleep"),
             ffprobe: PathBuf::from("/bin/sleep"),
             timeout_ms,
+            accurate_reencode_timeout_ms: timeout_ms,
+            core003_enabled: false,
             max_output_bytes,
         }
     }

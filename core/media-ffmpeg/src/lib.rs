@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Bounded local FFmpeg adapter. No shell, reencoding, networking or native UI.
+//! Bounded local FFmpeg adapter. Explicit opt-in reencoding; no shell, network or UI.
 
+mod accurate;
 mod files;
 mod media;
 mod process;
+mod quality;
+mod scope;
 mod time;
 mod trim;
 
-use media_domain::{BackendConfig, MAX_MEDIA_RESULT_BYTES, MediaError, MediaRequest};
+use media_domain::{BackendConfig, MAX_MEDIA_RESULT_BYTES, MediaError, MediaRequest, TrimStrategy};
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicBool;
 
@@ -83,11 +86,29 @@ pub fn backend_capabilities(config: &BackendConfig) -> Value {
         |error| error.code,
     );
     let versions = checked.ok();
+    // Old configurations never run a new encoder probe: their observable mock
+    // and stream-copy capability behavior remains backward compatible.
+    let encoder_check = if available && config.core003_enabled {
+        Some(accurate::encoders(&context))
+    } else {
+        None
+    };
+    let accurate_available = encoder_check.as_ref().is_some_and(Result::is_ok);
+    let accurate_reason = if !config.core003_enabled {
+        "core003_not_enabled"
+    } else if !available {
+        reason
+    } else {
+        encoder_check.as_ref().map_or("DEPENDENCY_MISSING", |r| {
+            r.as_ref().err().map_or("available", |e| e.code)
+        })
+    };
     json!({
         "schema_version":0,"core_version":env!("CARGO_PKG_VERSION"),"platform":format!("{}-{}",std::env::consts::OS,std::env::consts::ARCH),"mock_only":false,
         "features":{
             "probe":{"available":available,"reason":reason},"trim_stream_copy":{"available":available,"reason":reason},
-            "accurate_reencode":{"available":false,"reason":"not_implemented"},"ai_separation":{"available":false,"reason":"not_implemented"},"mock_job":{"available":true}
+            "trim_stream_copy_v1":{"available":available && config.core003_enabled,"reason":if config.core003_enabled {reason} else {"core003_not_enabled"},"profile":"mp4_h264_copy_v1"},
+            "accurate_reencode":{"available":accurate_available,"reason":accurate_reason,"profile":"mp4_h264_standard_v1"},"ai_separation":{"available":false,"reason":"not_implemented"},"mock_job":{"available":true}
         },
         "media_backend":{"name":"ffmpeg_cli","ffmpeg_version":versions.as_ref().map(|v|&v.0),"ffprobe_version":versions.as_ref().map(|v|&v.1)},
         "limits":{"accepted_platform":"macOS","demuxer":"mov","container":"mp4","video":"h264","audio":"aac","maximum_streams":16,"maximum_frames":100000,
@@ -95,6 +116,7 @@ pub fn backend_capabilities(config: &BackendConfig) -> Value {
             "probe_video_codec":"demuxer_supported_single_video","trim_video_codec":"h264","trim_audio_codecs":["aac"],
             "trim_rotation_and_explicit_colour_metadata":"unsupported_pending_acceptance",
             "trim_alignment":"enclose_keyframes","full_frame_and_packet_validation":true,"perceptual_av_sync_verified":false}
+        ,"core003_limits":{"enabled":config.core003_enabled,"maximum_duration_us":600000000,"maximum_long_edge":1920,"maximum_short_edge":1080,"maximum_audio_tracks":2,"video":"h264 yuv420p CFR","audio":"AAC-LC 44100/48000Hz mono/stereo","colour":"BT.709 tv or unspecified","accurate_reencode_timeout_ms":config.accurate_reencode_timeout_ms,"accurate_software_encoder":"libx264 CRF23 medium; AAC 192k stereo / 96k mono","audio_content_comparison":"8kHz band-limited, <=60s windows, per channel; not a perceptual listening claim"}
     })
 }
 
@@ -105,7 +127,22 @@ pub fn execute(
     request: &MediaRequest,
     cancel: &AtomicBool,
 ) -> Result<Value, MediaError> {
-    let context = process::Context::new(config, cancel);
+    let strategy = match request {
+        MediaRequest::Trim { strategy, .. } => Some(*strategy),
+        _ => None,
+    };
+    if strategy.is_some_and(|s| s != TrimStrategy::StreamCopy) && !config.core003_enabled {
+        return Err(MediaError::new(
+            "UNSUPPORTED_BACKEND",
+            "CORE-003 profiles require explicit backend opt-in.",
+        ));
+    }
+    let timeout = if strategy == Some(TrimStrategy::AccurateReencode) {
+        config.accurate_reencode_timeout_ms
+    } else {
+        config.timeout_ms
+    };
+    let context = process::Context::with_timeout(config, cancel, timeout);
     context.check()?;
     let path = match request {
         MediaRequest::Probe { source } | MediaRequest::Trim { source, .. } => source,
@@ -139,7 +176,21 @@ pub fn execute(
             destination,
             start_us,
             end_us,
+            strategy,
             ..
-        } => trim::execute(&context, &source, destination, media, *start_us, *end_us),
+        } => match strategy {
+            TrimStrategy::AccurateReencode => {
+                accurate::execute(&context, &source, destination, media, *start_us, *end_us)
+            }
+            TrimStrategy::StreamCopy | TrimStrategy::StreamCopyV1 => trim::execute(
+                &context,
+                &source,
+                destination,
+                media,
+                *start_us,
+                *end_us,
+                *strategy == TrimStrategy::StreamCopyV1,
+            ),
+        },
     }
 }
