@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "scope": "Integration-approved fixture-only reference plan from observed B-frame packet boundaries; not a Core/UI decision or general trim algorithm",
+  "approval_basis": "Original -ss1.1/-t1.5 retains decoded indices30..78,81 and is rejected; explicit -t1.45 preserves continuous30..78 under this fixed build/input",
+  "rules_sha256": "9e387fcba30de2e1cb3e8054a1564c823dc226625489b235d2e835cfdd2a2e06",
+  "ffmpeg_version_first_line": "ffmpeg version 7.1.1 Copyright (c) 2000-2025 the FFmpeg developers",
+  "ffmpeg_executable_sha256": "edab6bcbbd5ee1d34be9dd088b52faf6bc75f1bf4d4693506b748f12d5526e81",
+  "requested_start_seconds": "1.1",
+  "requested_duration_seconds": "1.5",
+  "execution_duration_seconds": "1.45",
+  "source_sha256": {
+    "cfr_bframes": "1dfdda5330c08b8ea22d21d5b2694aaf3dc2cfd43efe415219469ebbb345ee3a",
+    "multi_audio": "292ac83dc3b6651ec23807d486152e3c48b9ff25e6c00e86fa4fdd6936a6c31e",
+    "unicode_path": "1dfdda5330c08b8ea22d21d5b2694aaf3dc2cfd43efe415219469ebbb345ee3a"
+  }
+}

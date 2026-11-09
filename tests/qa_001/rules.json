@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "scope": "QA-001 synthetic FFmpeg reference; not Core media acceptance",
+  "generation": {"width": 160, "height": 96, "duration_seconds": 4, "rate": 30, "threads": 1},
+  "fixtures": {
+    "cfr_bframes": {"filename": "cfr_bframes.mp4", "video_codecs": ["h264"], "audio_codecs": ["aac"], "duration_min": 3.9, "duration_max": 4.1, "video_pts": "constant", "require_b_frames": true, "keyframe_period_seconds": 1},
+    "vfr": {"filename": "vfr.mp4", "video_codecs": ["h264"], "audio_codecs": [], "duration_min": 3.8, "duration_max": 4.1, "video_pts": "variable", "require_b_frames": true},
+    "multi_audio": {"filename": "multi_audio.mp4", "video_codecs": ["h264"], "audio_codecs": ["aac", "aac"], "audio_languages": ["eng", "zho"], "duration_min": 3.9, "duration_max": 4.1, "video_pts": "constant", "require_distinct_decoded_audio": true},
+    "no_audio": {"filename": "no_audio.mp4", "video_codecs": ["h264"], "audio_codecs": [], "duration_min": 3.9, "duration_max": 4.1, "video_pts": "constant"},
+    "unicode_path": {"filename": "Unicode 空格/合成 ; $() [示例] '片段'.mp4", "video_codecs": ["h264"], "audio_codecs": ["aac"], "duration_min": 3.9, "duration_max": 4.1, "video_pts": "constant", "same_bytes_as": "cfr_bframes"},
+    "truncated": {"filename": "truncated.mp4", "expected_probe": "nonzero", "expected_decode": "nonzero", "source": "cfr_bframes", "retained_bytes": 32}
+  },
+  "stream_copy": {
+    "sources": ["cfr_bframes", "multi_audio", "unicode_path"],
+    "requested_start_seconds": "1.1",
+    "requested_duration_seconds": "1.5",
+    "expected_preceding_keyframe_seconds": "1.0",
+    "first_source_packet_tolerance_seconds": "0.04",
+    "output_duration_min_seconds": "1.4",
+    "output_duration_max_seconds": "2.0",
+    "max_av_end_difference_seconds": "0.15",
+    "note": "Input-side seeking plus stream copy may align before requested 1.1s. Match output packet payload hashes to source, record actual source range and output timing; never claim arbitrary-frame exact lossless trim."
+  },
+  "cancellation": {"maximum_wait_seconds": 8, "requested_duration_seconds": 120, "require_progress_before_cancel": true, "expected_exit": "nonzero", "cleanup_owned_temporary_file": true},
+  "invalid_ranges": [{"start_us": 1000000, "end_us": 1000000}, {"start_us": 2000000, "end_us": 1000000}, {"start_us": -1, "end_us": 1000000}, {"start_us": 0, "end_us": 5000000}],
+  "core_media_acceptance": "BLOCKED: CORE-001 has no probe/trim media implementation; these rules are input/reference fixtures for CORE-002."
+}
