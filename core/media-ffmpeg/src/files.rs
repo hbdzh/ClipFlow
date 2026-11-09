@@ -16,6 +16,7 @@ fn creation_error(error: &std::io::Error, message: &'static str) -> MediaError {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Source {
     pub path: PathBuf,
     metadata: Metadata,
@@ -236,6 +237,20 @@ impl Drop for Temporary {
         // Explicit callers report cleanup errors. The non-panicking destructor is
         // only an unwind fallback, and removes no unknown directory contents.
         let _ = self.cleanup();
+    }
+}
+
+impl Source {
+    pub(crate) fn identity(&self) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}:{}", self.metadata.dev(), self.metadata.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            format!("{:?}", self.path)
+        }
     }
 }
 

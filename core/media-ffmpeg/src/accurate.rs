@@ -244,8 +244,36 @@ pub(crate) fn execute(
     start_us: i64,
     end_us: i64,
 ) -> Result<Value, MediaError> {
+    execute_options(context, source, destination, media, start_us, end_us, None)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_options(
+    context: &Context<'_>,
+    source: &Source,
+    destination: &Path,
+    mut media: Media,
+    start_us: i64,
+    end_us: i64,
+    options: Option<&crate::transcode::Options>,
+) -> Result<Value, MediaError> {
     let rate = scope::supported(&media)?;
     encoders(context)?;
+    let all_retained = options.is_none_or(|o| {
+        o.indices.len()
+            == media
+                .streams
+                .iter()
+                .filter(|s| s["codec_type"] == "audio")
+                .count()
+    });
+    if let Some(o) = options {
+        media.streams.retain(|s| {
+            s["codec_type"] == "video"
+                || s["index"]
+                    .as_i64()
+                    .is_some_and(|i| o.indices.contains(&(i as u32)))
+        });
+    }
     let destination = files::destination(source, destination)?;
     let plan = select(&media, start_us, end_us)?;
     for stream in media.streams.iter().filter(|s| s["codec_type"] == "audio") {
@@ -259,6 +287,9 @@ pub(crate) fn execute(
             "[0:{}]trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS[v]",
             media.video_index, plan.start, plan.end
         );
+        if let Some(o) = options {
+            filter = filter.replace("[v]", &format!(",{}[v]", o.filter()));
+        }
         let mut audio_ordinal = 0;
         for stream in &media.streams {
             if stream["codec_type"] == "audio" {
@@ -302,7 +333,11 @@ pub(crate) fn execute(
             "-preset",
             "medium",
             "-crf",
-            "23",
+            if options.is_some_and(|o| o.profile == media_domain::TranscodeProfile::Small720) {
+                "25"
+            } else {
+                "23"
+            },
             "-pix_fmt",
             "yuv420p",
             "-r",
@@ -336,9 +371,21 @@ pub(crate) fn execute(
         for stream in &media.streams {
             if stream["codec_type"] == "audio" {
                 let bitrate = if integer(&stream["channels"])? == 1 {
-                    "96k"
+                    if options
+                        .is_some_and(|o| o.profile == media_domain::TranscodeProfile::Small720)
+                    {
+                        "64k"
+                    } else {
+                        "96k"
+                    }
                 } else {
-                    "192k"
+                    if options
+                        .is_some_and(|o| o.profile == media_domain::TranscodeProfile::Small720)
+                    {
+                        "128k"
+                    } else {
+                        "192k"
+                    }
                 };
                 command.extend(args(&[
                     &format!("-b:a:{audio_ordinal}"),
@@ -360,32 +407,89 @@ pub(crate) fn execute(
         // microsecond resolution rather than shifting audio in the validator.
         command.extend(args(&["-movie_timescale", "1000000", "-f", "mp4"]));
         command.push(temporary.path.as_os_str().to_owned());
-        context.run(&context.config.ffmpeg, &command)?;
+        if let Some(o) = options {
+            context.run_media(&context.config.ffmpeg, &command, &temporary.path, o.budget)?;
+        } else {
+            context.run_media(
+                &context.config.ffmpeg,
+                &command,
+                &temporary.path,
+                context.media_file_budget.unwrap_or(u64::MAX),
+            )?;
+        }
+        let mut layout_reference = media.clone();
+        if let Some(o) = options {
+            for stream in &mut layout_reference.streams {
+                if stream["codec_type"] == "video" {
+                    stream["width"] = json!(o.canvas_width);
+                    stream["height"] = json!(o.canvas_height);
+                }
+            }
+        }
         let output = media::inspect(context, &temporary.path)?;
-        let (av_error, channels) = layout(&media, &output, &plan)?;
+        let (av_error, channels) = layout(&layout_reference, &output, &plan)?;
         let packet_count = media::validate_decode_order(context, &temporary.path, &output.streams)?;
         media::full_decode(context, &temporary.path)?;
-        let video_quality = quality::video(
-            context,
-            &source.path,
-            &temporary.path,
-            plan.start,
-            plan.end,
-            rate,
-        )?;
-        let audio_quality = quality::audio(
-            context,
-            &source.path,
-            &temporary.path,
-            plan.source_start_us,
-            plan.source_requested_end_us,
-            &channels,
-        )?;
-        let result = json!({"schema_version":0,"mock_only":false,"file_created":true,"strategy":"accurate_reencode","profile":"mp4_h264_standard_v1","reencoded":true,"lossless":false,
+        let video_quality = if options.is_none() {
+            quality::video(
+                context,
+                &source.path,
+                &temporary.path,
+                plan.start,
+                plan.end,
+                rate,
+            )?
+        } else {
+            quality::video_scaled(
+                context,
+                &source.path,
+                &temporary.path,
+                plan.start,
+                plan.end,
+                rate,
+                options.map(|o| o.filter()).as_deref(),
+            )?
+        };
+        let audio_quality = if options.is_none() {
+            quality::audio(
+                context,
+                &source.path,
+                &temporary.path,
+                plan.source_start_us,
+                plan.source_requested_end_us,
+                &channels,
+            )?
+        } else {
+            quality::audio_selected(
+                context,
+                &source.path,
+                &temporary.path,
+                plan.source_start_us,
+                plan.source_requested_end_us,
+                &channels,
+                &options
+                    .map(|o| o.ordinals.clone())
+                    .unwrap_or_else(|| (0..channels.len()).collect()),
+            )?
+        };
+        let mut result = json!({"schema_version":0,"mock_only":false,"file_created":true,"strategy":"accurate_reencode","profile":"mp4_h264_standard_v1","reencoded":true,"lossless":false,
             "requested_range_us":{"start_us":start_us,"end_us":end_us},"actual_range_us":{"start_us":plan.start_us,"end_us":plan.end_us},
             "actual_source_range_us":{"start_us":plan.source_start_us,"end_us":media.time_base.micros(plan.end_pts)?},"output_media_info":output.info,
             "accurate_plan":{"source_time_base":format!("{}/{}",media.time_base.numerator,media.time_base.denominator),"source_first_frame_index":plan.start,"source_end_frame_index_exclusive":plan.end,"actual_start_pts":plan.start_pts,"actual_end_exclusive_pts":plan.end_pts,"common_output_origin_source_pts":plan.start_pts,"video_frame_selection":"source PTS>=request start and PTS<request end, checked integer rational comparison","video_encoder":"libx264","quality_crf":23,"preset":"medium","lossless":false},
             "validation":{"all_streams_retained":true,"decode_all_streams":true,"verified_video_frames":output.frames.len(),"verified_output_packet_count":packet_count,"packet_dts_monotonic":true,"decoded_presentation_pts_monotonic":true,"video_timestamp_tolerance_us":2000,"audio_mapping_maximum_error_us":av_error,"video_quality":video_quality,"audio_bandlimited_content":audio_quality,"perceptual_av_sync_verified":false,"full_colour_fidelity_verified":false,"source_identity_unchanged":true}});
+        if let Some(o) = options {
+            result["strategy"] = json!("transcode");
+            result["profile"] = json!(o.profile.as_str());
+            result["transcode_plan"] = o.summary();
+            result["validation"]["all_streams_retained"] = json!(all_retained);
+            result["validation"]["all_selected_streams_retained"] = json!(true);
+            result["accurate_plan"]["quality_crf"] =
+                json!(if o.profile == media_domain::TranscodeProfile::Small720 {
+                    25
+                } else {
+                    23
+                });
+        }
         if serde_json::to_vec(&result).map_err(|_| validation())?.len() > MAX_MEDIA_RESULT_BYTES {
             return Err(MediaError::new(
                 "RESOURCE_LIMIT",
@@ -401,6 +505,15 @@ pub(crate) fn execute(
         temporary.cleanup()?;
     }
     outcome
+}
+
+pub(crate) fn preflight(media: &Media, start: i64, end: i64) -> Result<(), MediaError> {
+    scope::supported(media)?;
+    let plan = select(media, start, end)?;
+    for stream in media.streams.iter().filter(|s| s["codec_type"] == "audio") {
+        audio_interval(stream, &plan)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

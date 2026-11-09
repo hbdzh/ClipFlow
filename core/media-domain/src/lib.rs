@@ -61,11 +61,57 @@ pub struct BackendConfig {
     pub timeout_ms: u64,
     pub accurate_reencode_timeout_ms: u64,
     pub core003_enabled: bool,
+    pub core004_enabled: bool,
+    pub transcode_timeout_ms: u64,
     pub max_output_bytes: usize,
 }
 
 pub const ACCURATE_REENCODE_PROFILE: &str = "mp4_h264_standard_v1";
 pub const STREAM_COPY_V1_PROFILE: &str = "mp4_h264_copy_v1";
+
+pub const SMALL_720_PROFILE: &str = "mp4_h264_720p_v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaRange {
+    pub start_us: i64,
+    pub end_us: i64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranscodeProfile {
+    Standard,
+    Small720,
+}
+impl TranscodeProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => ACCURATE_REENCODE_PROFILE,
+            Self::Small720 => SMALL_720_PROFILE,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioSelection {
+    All,
+    One { stream_index: u32 },
+    None,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueueCommand {
+    BatchSubmit {
+        submission_id: String,
+        items: Vec<MediaRequest>,
+    },
+    Snapshot,
+    Reorder {
+        job_ids: Vec<String>,
+    },
+    Retry {
+        job_id: String,
+        new_destination: PathBuf,
+        submission_id: String,
+    },
+    ClearHistory,
+}
 
 /// Validated strategy, never a caller-supplied codec/filter argument.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +123,13 @@ pub enum TrimStrategy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MediaRequest {
+    Transcode {
+        source: PathBuf,
+        destination: PathBuf,
+        range: Option<MediaRange>,
+        profile: TranscodeProfile,
+        audio_selection: AudioSelection,
+    },
     Probe {
         source: PathBuf,
     },
@@ -93,6 +146,7 @@ impl MediaRequest {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Probe { .. } => "probe",
+            Self::Transcode { .. } => "transcode",
             Self::Trim { .. } => "trim",
         }
     }
@@ -102,6 +156,7 @@ impl MediaRequest {
 pub enum Request {
     Mock(MockOutcome),
     Media(MediaRequest),
+    Queue(QueueCommand),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +239,8 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
             "timeout_ms",
             "accurate_reencode_timeout_ms",
             "core003_enabled",
+            "core004_enabled",
+            "transcode_timeout_ms",
             "max_output_bytes",
         ],
     )?;
@@ -214,7 +271,19 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         None => false,
         Some(value) => value.as_bool().ok_or(CoreError::InvalidArgument)?,
     };
-    if !(1..=300_000).contains(&timeout_ms)
+    let core004_enabled = match map.get("core004_enabled") {
+        None => false,
+        Some(v) => v.as_bool().ok_or(CoreError::InvalidArgument)?,
+    };
+    let transcode_timeout_ms = match map.get("transcode_timeout_ms") {
+        None => 600_000,
+        Some(v) => v.as_u64().ok_or(CoreError::InvalidArgument)?,
+    };
+    if core004_enabled && !core003_enabled {
+        return Err(CoreError::InvalidArgument);
+    }
+    if !(1..=7_200_000).contains(&transcode_timeout_ms)
+        || !(1..=300_000).contains(&timeout_ms)
         || !(1..=7_200_000).contains(&accurate_reencode_timeout_ms)
         || !(1024..=64 * 1024 * 1024).contains(&max_output_bytes)
     {
@@ -226,6 +295,8 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         timeout_ms,
         accurate_reencode_timeout_ms,
         core003_enabled,
+        core004_enabled,
+        transcode_timeout_ms,
         max_output_bytes: max_output_bytes as usize,
     })
 }
@@ -298,6 +369,91 @@ pub fn parse_request(input: &[u8]) -> Result<Request, CoreError> {
         .ok_or(CoreError::InvalidArgument)?
     {
         "mock" => parse_mock_request(input).map(Request::Mock),
+        "transcode" => parse_transcode(&map).map(Request::Media),
+        "batch_submit" => {
+            allowed_fields(
+                &map,
+                &["schema_version", "operation", "submission_id", "items"],
+            )?;
+            let submission_id = parse_submission_id(map.get("submission_id"))?;
+            let items = map
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or(CoreError::InvalidArgument)?;
+            if items.is_empty() {
+                return Err(CoreError::InvalidArgument);
+            }
+            if items.len() > 32 {
+                return Err(CoreError::LimitExceeded);
+            }
+            let mut parsed = Vec::with_capacity(items.len());
+            for item in items {
+                let bytes = serde_json::to_vec(item).map_err(|_| CoreError::Internal)?;
+                match parse_request(&bytes)? {
+                    Request::Media(
+                        request @ (MediaRequest::Trim { .. } | MediaRequest::Transcode { .. }),
+                    ) => parsed.push(request),
+                    _ => return Err(CoreError::InvalidArgument),
+                }
+            }
+            Ok(Request::Queue(QueueCommand::BatchSubmit {
+                submission_id,
+                items: parsed,
+            }))
+        }
+        "queue_snapshot" => {
+            allowed_fields(&map, &["schema_version", "operation"])?;
+            Ok(Request::Queue(QueueCommand::Snapshot))
+        }
+        "history_clear" => {
+            allowed_fields(&map, &["schema_version", "operation"])?;
+            Ok(Request::Queue(QueueCommand::ClearHistory))
+        }
+        "queue_reorder" => {
+            allowed_fields(&map, &["schema_version", "operation", "job_ids"])?;
+            let values = map
+                .get("job_ids")
+                .and_then(Value::as_array)
+                .ok_or(CoreError::InvalidArgument)?;
+            if values.len() > 32 {
+                return Err(CoreError::InvalidArgument);
+            }
+            let mut job_ids = Vec::new();
+            for v in values {
+                let id = v.as_str().ok_or(CoreError::InvalidArgument)?;
+                validate_job_id(id)?;
+                if job_ids.iter().any(|old| old == id) {
+                    return Err(CoreError::InvalidArgument);
+                }
+                job_ids.push(id.to_owned());
+            }
+            Ok(Request::Queue(QueueCommand::Reorder { job_ids }))
+        }
+        "job_retry" => {
+            allowed_fields(
+                &map,
+                &[
+                    "schema_version",
+                    "operation",
+                    "job_id",
+                    "new_destination",
+                    "submission_id",
+                ],
+            )?;
+            let id = map
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or(CoreError::InvalidArgument)?;
+            validate_job_id(id)?;
+            Ok(Request::Queue(QueueCommand::Retry {
+                job_id: id.to_owned(),
+                new_destination: uri_path(
+                    map.get("new_destination")
+                        .ok_or(CoreError::InvalidArgument)?,
+                )?,
+                submission_id: parse_submission_id(map.get("submission_id"))?,
+            }))
+        }
         "probe" => {
             allowed_fields(&map, &["schema_version", "operation", "source"])?;
             Ok(Request::Media(MediaRequest::Probe {
@@ -396,4 +552,110 @@ pub fn validate_job_id(id: &str) -> Result<(), CoreError> {
         return Err(CoreError::LimitExceeded);
     }
     Ok(())
+}
+
+fn parse_submission_id(value: Option<&Value>) -> Result<String, CoreError> {
+    let id = value
+        .and_then(Value::as_str)
+        .ok_or(CoreError::InvalidArgument)?;
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(CoreError::InvalidArgument);
+    }
+    Ok(id.to_owned())
+}
+fn parse_transcode(map: &Map<String, Value>) -> Result<MediaRequest, CoreError> {
+    allowed_fields(
+        map,
+        &[
+            "schema_version",
+            "operation",
+            "source",
+            "destination",
+            "range",
+            "profile",
+            "audio_selection",
+        ],
+    )?;
+    let profile = match map.get("profile").and_then(Value::as_str) {
+        Some(ACCURATE_REENCODE_PROFILE) => TranscodeProfile::Standard,
+        Some(SMALL_720_PROFILE) => TranscodeProfile::Small720,
+        _ => return Err(CoreError::InvalidArgument),
+    };
+    let default_audio = serde_json::json!({"mode":"all_supported"});
+    let audio = map
+        .get("audio_selection")
+        .unwrap_or(&default_audio)
+        .as_object()
+        .ok_or(CoreError::InvalidArgument)?;
+    allowed_fields(audio, &["mode", "stream_index"])?;
+    let audio_selection = match audio.get("mode").and_then(Value::as_str) {
+        Some("all_supported") if !audio.contains_key("stream_index") => AudioSelection::All,
+        Some("none") if !audio.contains_key("stream_index") => AudioSelection::None,
+        Some("one") => AudioSelection::One {
+            stream_index: audio
+                .get("stream_index")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or(CoreError::InvalidArgument)?,
+        },
+        _ => return Err(CoreError::InvalidArgument),
+    };
+    let range = map
+        .get("range")
+        .map(|v| -> Result<MediaRange, CoreError> {
+            let r = v.as_object().ok_or(CoreError::InvalidArgument)?;
+            allowed_fields(r, &["start_us", "end_us"])?;
+            let start_us = r
+                .get("start_us")
+                .and_then(Value::as_i64)
+                .ok_or(CoreError::InvalidArgument)?;
+            let end_us = r
+                .get("end_us")
+                .and_then(Value::as_i64)
+                .ok_or(CoreError::InvalidArgument)?;
+            if start_us < 0 || end_us <= start_us {
+                return Err(CoreError::InvalidArgument);
+            }
+            Ok(MediaRange { start_us, end_us })
+        })
+        .transpose()?;
+    Ok(MediaRequest::Transcode {
+        source: uri_path(map.get("source").ok_or(CoreError::InvalidArgument)?)?,
+        destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
+        range,
+        profile,
+        audio_selection,
+    })
+}
+
+/// Frozen P01/P02 geometry in the supported source envelope. The tuple is
+/// (content width, content height, even canvas width, even canvas height).
+/// Checked integer arithmetic makes half-up rounding deterministic for clients.
+pub fn transcode_geometry(
+    w: i64,
+    h: i64,
+    p: TranscodeProfile,
+) -> Result<(i64, i64, i64, i64), CoreError> {
+    if w < 2 || h < 2 || w % 2 != 0 || h % 2 != 0 || w.max(h) > 1920 || w.min(h) > 1080 {
+        return Err(CoreError::InvalidArgument);
+    }
+    if p == TranscodeProfile::Standard {
+        return Ok((w, h, w, h));
+    }
+    let (bw, bh) = if w >= h { (1280, 720) } else { (720, 1280) };
+    let (n, d) = if w <= bw && h <= bh {
+        (1, 1)
+    } else if bw * h <= bh * w {
+        (bw, w)
+    } else {
+        (bh, h)
+    };
+    let x = ((w * n * 2 + d) / (2 * d)).max(2);
+    let y = ((h * n * 2 + d) / (2 * d)).max(2);
+    Ok((x, y, (x + 1) / 2 * 2, (y + 1) / 2 * 2))
 }

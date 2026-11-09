@@ -9,6 +9,8 @@ fn missing_backend() -> BackendConfig {
         timeout_ms: 100,
         accurate_reencode_timeout_ms: 600_000,
         core003_enabled: false,
+        core004_enabled: false,
+        transcode_timeout_ms: 600000,
         max_output_bytes: 1024,
     }
 }

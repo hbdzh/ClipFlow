@@ -264,7 +264,12 @@ pub(crate) fn execute(
                 }
             }
             command.push(temporary.path.as_os_str().to_owned());
-            context.run(&context.config.ffmpeg, &command)?;
+            context.run_media(
+                &context.config.ffmpeg,
+                &command,
+                &temporary.path,
+                context.media_file_budget.unwrap_or(u64::MAX),
+            )?;
             let output = media::inspect(context, &temporary.path)?;
             if extended {
                 crate::scope::supported(&output).map_err(|_| {
@@ -382,4 +387,19 @@ pub(crate) fn execute(
         }
     }
     Err(last_error)
+}
+
+pub(crate) fn preflight(
+    media: &Media,
+    start: i64,
+    end: i64,
+    extended: bool,
+) -> Result<(), MediaError> {
+    if extended {
+        crate::scope::supported(media)?;
+    } else {
+        supported(media)?;
+    }
+    plan(media, start, end)?;
+    Ok(())
 }

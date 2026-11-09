@@ -3,6 +3,8 @@
 //! A bounded job engine shared by the CLI and FFI. Mock jobs remain poll-driven;
 //! explicitly configured media jobs run on one serial worker per engine.
 
+mod heavy;
+mod queue;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,7 +131,12 @@ struct Scheduler {
     worker: JoinHandle<()>,
 }
 
-fn run_worker(receiver: mpsc::Receiver<Work>, shutdown: Arc<AtomicBool>, executor: Executor) {
+fn run_worker(
+    receiver: mpsc::Receiver<Work>,
+    shutdown: Arc<AtomicBool>,
+    executor: Executor,
+    real_executor: bool,
+) {
     while !shutdown.load(Ordering::Acquire) {
         let work = match receiver.recv() {
             Ok(work) => work,
@@ -137,6 +144,38 @@ fn run_worker(receiver: mpsc::Receiver<Work>, shutdown: Arc<AtomicBool>, executo
         };
         if shutdown.load(Ordering::Acquire) {
             break;
+        }
+        if real_executor && heavy::quarantined() {
+            if let Ok(mut state) = work.shared.state.lock() {
+                state.state = JobState::Failed;
+                state.error = Some(MediaError::new(
+                    "CLEANUP_FAILED",
+                    "A process-wide media resource is quarantined.",
+                ));
+            }
+            continue;
+        }
+        let mut heavy_permit = None;
+        if real_executor && !matches!(work.request, MediaRequest::Probe { .. }) {
+            loop {
+                if work.shared.cancel.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                match heavy::try_acquire() {
+                    Ok(Some(permit)) => {
+                        heavy_permit = Some(permit);
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(error) => {
+                        if let Ok(mut state) = work.shared.state.lock() {
+                            state.state = JobState::Failed;
+                            state.error = Some(error);
+                        }
+                        break;
+                    }
+                }
+            }
         }
         {
             let Ok(mut state) = work.shared.state.lock() else {
@@ -159,12 +198,33 @@ fn run_worker(receiver: mpsc::Receiver<Work>, shutdown: Arc<AtomicBool>, executo
             Ok(result) => result,
             Err(payload) => {
                 std::mem::forget(payload);
-                Err(MediaError::new(
-                    "INTERNAL",
-                    "The media worker failed internally.",
-                ))
+                if real_executor {
+                    heavy::quarantine();
+                    if let Some(permit) = &mut heavy_permit {
+                        permit.quarantine();
+                    }
+                    Err(MediaError::new(
+                        "CLEANUP_FAILED",
+                        "The media worker unwound without confirmed cleanup.",
+                    ))
+                } else {
+                    Err(MediaError::new(
+                        "INTERNAL",
+                        "The controlled test executor failed internally.",
+                    ))
+                }
             }
         };
+        if outcome
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code == "CLEANUP_FAILED")
+        {
+            heavy::quarantine();
+            if let Some(permit) = &mut heavy_permit {
+                permit.quarantine();
+            }
+        }
         if let Ok(mut state) = work.shared.state.lock() {
             match outcome {
                 // Backend validates its <=128KiB summary BEFORE publishing files.
@@ -195,16 +255,34 @@ pub struct Engine {
     media_backend: Option<BackendConfig>,
     scheduler: Option<Scheduler>,
     executor: Executor,
+    queue: Option<queue::QueueEngine>,
+    real_executor: bool,
 }
 
 impl Engine {
     pub fn new(config: &[u8]) -> Result<Self, CoreError> {
-        Self::with_executor(config, Arc::new(media_ffmpeg::execute))
+        Self::configured(config, Arc::new(media_ffmpeg::execute), true)
     }
 
+    #[cfg(test)]
     fn with_executor(config: &[u8], executor: Executor) -> Result<Self, CoreError> {
+        Self::configured(config, executor, false)
+    }
+    fn configured(
+        config: &[u8],
+        executor: Executor,
+        real_executor: bool,
+    ) -> Result<Self, CoreError> {
         let config = parse_config(config)?;
+        let queue = config
+            .media_backend
+            .as_ref()
+            .filter(|c| c.core004_enabled)
+            .map(|c| queue::QueueEngine::new(c.clone()))
+            .transpose()?;
         Ok(Self {
+            queue,
+            real_executor,
             max_jobs: config.max_jobs,
             next_id: 1,
             jobs: BTreeMap::new(),
@@ -216,7 +294,7 @@ impl Engine {
 
     pub fn version(&self) -> Value {
         json!({"schema_version":0,"core_version":env!("CARGO_PKG_VERSION"),"abi_version":0,
-            "stage":if self.media_backend.is_some(){"CORE-002"}else{"CORE-001"},
+            "stage":if self.queue.is_some(){"CORE-004"}else if self.media_backend.is_some(){"CORE-002"}else{"CORE-001"},
             "mock_only":self.media_backend.is_none()})
     }
 
@@ -235,9 +313,10 @@ impl Engine {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let executor = self.executor.clone();
+        let real_executor = self.real_executor;
         let worker = std::thread::Builder::new()
             .name("mediastudio-media-worker".into())
-            .spawn(move || run_worker(receiver, thread_shutdown, executor))
+            .spawn(move || run_worker(receiver, thread_shutdown, executor, real_executor))
             .map_err(|_| CoreError::Internal)?;
         self.scheduler = Some(Scheduler {
             sender,
@@ -248,6 +327,9 @@ impl Engine {
     }
 
     pub fn submit(&mut self, request: &[u8]) -> Result<Value, CoreError> {
+        if let Some(queue) = &mut self.queue {
+            return queue.submit(request);
+        }
         // Preserve the exact CORE-001 rejection for media-shaped inputs when the
         // host did not explicitly opt in, even if their media fields are absent.
         let request = if self.media_backend.is_none() {
@@ -255,6 +337,15 @@ impl Engine {
         } else {
             parse_request(request)?
         };
+        if matches!(request, Request::Media(_)) && heavy::quarantined() {
+            return Err(CoreError::Internal);
+        }
+        if matches!(
+            request,
+            Request::Queue(_) | Request::Media(MediaRequest::Transcode { .. })
+        ) {
+            return Err(CoreError::UnsupportedOperation);
+        }
         if self.jobs.len() >= self.max_jobs {
             return Err(CoreError::LimitExceeded);
         }
@@ -272,6 +363,7 @@ impl Engine {
             self.next_id
         );
         let (job, response) = match request {
+            Request::Queue(_) => return Err(CoreError::UnsupportedOperation),
             Request::Mock(outcome) => {
                 let job = MockJob {
                     state: JobState::Queued,
@@ -320,6 +412,9 @@ impl Engine {
     }
 
     pub fn snapshot(&mut self, id: &str) -> Result<Value, CoreError> {
+        if let Some(queue) = &self.queue {
+            return queue.snapshot(id);
+        }
         validate_job_id(id)?;
         match self.jobs.get_mut(id).ok_or(CoreError::NotFound)? {
             Job::Mock(job) => {
@@ -335,6 +430,9 @@ impl Engine {
     }
 
     pub fn cancel(&mut self, id: &str) -> Result<(), CoreError> {
+        if let Some(queue) = &self.queue {
+            return queue.cancel(id);
+        }
         validate_job_id(id)?;
         match self.jobs.get_mut(id).ok_or(CoreError::NotFound)? {
             Job::Mock(job) => {
@@ -363,13 +461,19 @@ impl Engine {
     }
 
     pub fn has_active_jobs(&self) -> bool {
+        if let Some(queue) = &self.queue {
+            return queue.active();
+        }
         self.jobs.values().any(|job| match job {
             Job::Mock(job) => job.state.active(),
             // A poisoned status cannot safely establish quiescence.
-            Job::Media(shared) => shared
-                .state
-                .lock()
-                .map_or(true, |state| state.state.active()),
+            Job::Media(shared) => shared.state.lock().map_or(true, |state| {
+                state.state.active()
+                    || state
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| e.code == "CLEANUP_FAILED")
+            }),
         })
     }
 }

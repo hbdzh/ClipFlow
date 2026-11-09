@@ -1,0 +1,21 @@
+{
+  "schema_version": 0,
+  "operation": "batch_submit",
+  "submission_id": "EXAMPLE_batch_001",
+  "items": [
+    {
+      "schema_version": 0,
+      "operation": "transcode",
+      "source": {
+        "uri": "file:///EXAMPLE/source.mp4"
+      },
+      "destination": {
+        "uri": "file:///EXAMPLE/unique-output.mp4"
+      },
+      "profile": "mp4_h264_standard_v1",
+      "audio_selection": {
+        "mode": "all_supported"
+      }
+    }
+  ]
+}

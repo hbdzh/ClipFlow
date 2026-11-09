@@ -3,6 +3,12 @@
 //! Bounded local FFmpeg adapter. Explicit opt-in reencoding; no shell, network or UI.
 
 mod accurate;
+mod prepared;
+mod transcode;
+pub use prepared::{
+    PreparedMedia, destinations_equivalent, execute_prepared, preflight, quarantined,
+    resource_snapshot,
+};
 mod files;
 mod media;
 mod process;
@@ -108,7 +114,7 @@ pub fn backend_capabilities(config: &BackendConfig) -> Value {
         "features":{
             "probe":{"available":available,"reason":reason},"trim_stream_copy":{"available":available,"reason":reason},
             "trim_stream_copy_v1":{"available":available && config.core003_enabled,"reason":if config.core003_enabled {reason} else {"core003_not_enabled"},"profile":"mp4_h264_copy_v1"},
-            "accurate_reencode":{"available":accurate_available,"reason":accurate_reason,"profile":"mp4_h264_standard_v1"},"ai_separation":{"available":false,"reason":"not_implemented"},"mock_job":{"available":true}
+            "accurate_reencode":{"available":accurate_available,"reason":accurate_reason,"profile":"mp4_h264_standard_v1"},"transcode":{"available":accurate_available && config.core004_enabled,"reason":if config.core004_enabled {accurate_reason}else{"core004_not_enabled"},"profiles":["mp4_h264_standard_v1","mp4_h264_720p_v1"]},"batch_queue":{"available":available && config.core004_enabled,"reason":if config.core004_enabled {reason}else{"core004_not_enabled"}},"ai_separation":{"available":false,"reason":"not_implemented"},"mock_job":{"available":true}
         },
         "media_backend":{"name":"ffmpeg_cli","ffmpeg_version":versions.as_ref().map(|v|&v.0),"ffprobe_version":versions.as_ref().map(|v|&v.1)},
         "limits":{"accepted_platform":"macOS","demuxer":"mov","container":"mp4","video":"h264","audio":"aac","maximum_streams":16,"maximum_frames":100000,
@@ -127,6 +133,16 @@ pub fn execute(
     request: &MediaRequest,
     cancel: &AtomicBool,
 ) -> Result<Value, MediaError> {
+    if prepared::QUARANTINED.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(MediaError::new(
+            "CLEANUP_FAILED",
+            "Backend cleanup remains unconfirmed until process restart.",
+        ));
+    }
+    if matches!(request, MediaRequest::Transcode { .. }) {
+        let prepared = preflight(config, request, cancel)?;
+        return execute_prepared(config, &prepared, cancel);
+    }
     let strategy = match request {
         MediaRequest::Trim { strategy, .. } => Some(*strategy),
         _ => None,
@@ -145,7 +161,9 @@ pub fn execute(
     let context = process::Context::with_timeout(config, cancel, timeout);
     context.check()?;
     let path = match request {
-        MediaRequest::Probe { source } | MediaRequest::Trim { source, .. } => source,
+        MediaRequest::Probe { source }
+        | MediaRequest::Trim { source, .. }
+        | MediaRequest::Transcode { source, .. } => source,
     };
     let source = files::Source::open(path)?;
     if !cfg!(target_os = "macos") {
@@ -172,6 +190,7 @@ pub fn execute(
             }
             Ok(result)
         }
+        MediaRequest::Transcode { .. } => unreachable!("handled above"),
         MediaRequest::Trim {
             destination,
             start_us,
