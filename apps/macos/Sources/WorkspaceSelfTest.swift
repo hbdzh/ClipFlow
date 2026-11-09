@@ -21,6 +21,10 @@ private struct WorkspaceAction: Decodable {
     var ffprobe: String?
     var path: String?
     var contains: String?
+    var indices: [Int]?
+    var destinations: [String]?
+    var streamIndex: Int?
+    var submissionWait: Bool?
 }
 struct WorkspaceAssetEvidence: Encodable, Sendable {
     let id: UUID
@@ -32,6 +36,8 @@ struct WorkspaceAssetEvidence: Encodable, Sendable {
     let mode: ExportStrategy
     let mediaInfo: MediaInfo?
     let error: String?
+    let audioSelection: AudioSelection
+    let includedInBatch: Bool
 }
 struct WorkspaceTaskEvidence: Encodable, Sendable {
     let id: UUID
@@ -46,6 +52,8 @@ struct WorkspaceTaskEvidence: Encodable, Sendable {
     let error: JobFailure?
     let result: JobResult?
     let interrupted: Bool
+    let audioSelection: AudioSelection?
+    let sessionId: UUID?
 }
 struct WorkspaceStepEvidence: Encodable, Sendable {
     let action: String
@@ -65,10 +73,14 @@ struct WorkspaceStepEvidence: Encodable, Sendable {
     let actionWallTimeMs: Double?
     let canImport: Bool
     let canExport: Bool
+    let queue: QueueSnapshot?
+    let submissionErrors: [QueueRejection]
+    let submitting: Bool
+    let pendingSubmissionToken: String?
 }
 struct WorkspaceSelfTestReport: Encodable, Sendable {
     let schemaVersion = 1
-    let scope = "MAC-002 same production WorkspaceModel/CoreBridge/AVFoundation; scenario driver, no simulated job or media success"
+    let scope = "Production WorkspaceModel/CoreBridge/AVFoundation; MAC-002 compatibility or MAC-003 Core queue scenario driver, no simulated job or media success"
     let passed: Bool
     let steps: [WorkspaceStepEvidence]
     let heartbeatCount: Int
@@ -79,19 +91,19 @@ struct WorkspaceSelfTestReport: Encodable, Sendable {
 }
 @MainActor
 private func workspaceEvidence(_ model: WorkspaceModel, action: String, cachedDiagnostics: Bool = false, actionWallTimeMs: Double? = nil) async -> WorkspaceStepEvidence {
-    let bridgeDiagnostics = cachedDiagnostics ? model.cachedBridgeDiagnostics : await model.diagnostics()
+    let bridgeDiagnostics = (cachedDiagnostics || model.isSubmitting) ? model.cachedBridgeDiagnostics : await model.diagnostics()
     return WorkspaceStepEvidence(action: action, phase: model.phase, assets: model.assets.map { asset in
         let range: MediaRange?
         if let start = parseTimeText(asset.startText), let end = parseTimeText(asset.endText), end > start { range = MediaRange(startUs: start, endUs: end) } else { range = nil }
         return WorkspaceAssetEvidence(id: asset.id, sourceName: asset.url.lastPathComponent, state: asset.state, range: range,
-            startText: asset.startText, endText: asset.endText, mode: asset.mode, mediaInfo: asset.info, error: asset.failure)
+            startText: asset.startText, endText: asset.endText, mode: asset.mode, mediaInfo: asset.info, error: asset.failure, audioSelection: asset.audioSelection, includedInBatch: asset.includedInBatch)
     }, selectedAssetId: model.selectedAssetId, activeExport: model.activeExport, tasks: model.tasks.map { task in
         WorkspaceTaskEvidence(id: task.id, sourceAssetId: task.sourceAssetId, sourceName: task.sourceName, destinationName: task.destinationName,
             mode: task.mode, requestedRange: task.requestedRange, coreJobId: task.coreJobId, state: task.state,
-            actualRange: task.actualRange, error: task.failure, result: task.result, interrupted: task.interrupted)
+            actualRange: task.actualRange, error: task.failure, result: task.result, interrupted: task.interrupted, audioSelection: task.audioSelection, sessionId: task.sessionId)
     }, core: model.snapshot, trace: model.trace, preview: model.preview.diagnostics, bridgeDiagnostics: bridgeDiagnostics,
        accessDiagnostics: model.accessDiagnostics, error: model.issue, closed: model.closed,
-       shutdownDiagnostics: model.shutdownDiagnostics, actionWallTimeMs: actionWallTimeMs, canImport: model.canImport, canExport: model.canExport)
+       shutdownDiagnostics: model.shutdownDiagnostics, actionWallTimeMs: actionWallTimeMs, canImport: model.canImport, canExport: model.canExport, queue: model.queueSnapshot, submissionErrors: model.submissionErrors, submitting: model.isSubmitting, pendingSubmissionToken: model.pendingQueue?.token)
 }
 @MainActor
 func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
@@ -109,7 +121,7 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
         throw CheckFailure(message: "Scenario schema/version/action bound invalid")
     }
     let historyURL = URL(fileURLWithPath: scenario.historyPath)
-    var model = WorkspaceModel(historyPath: historyURL)
+    var model = WorkspaceModel(historyPath: historyURL, queueEnabled: CommandLine.arguments.contains("--queue-self-test"))
     var heartbeatCount = 0
     var maxInterval = 0.0
     var lastHeartbeat = ContinuousClock.now
@@ -159,6 +171,59 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
             case "mode":
                 guard let raw = action.value, let mode = ExportStrategy(rawValue: raw), mode != .legacyStreamCopy else { throw CheckFailure(message: "Workspace supports streamCopyV1 or accurateReencode") }
                 model.strategy = mode
+            case "submission-boundary-observation":
+                let marker = try absoluteURL(action.path)
+                let boundary = action.value ?? "before-connect"
+                let delay = min(5000, max(0, action.milliseconds ?? 500))
+                model.queueSubmissionObserver = { stage in
+                    guard stage == boundary else { return }
+                    try? Data(stage.utf8).write(to: marker, options: .atomic)
+                    try? await Task.sleep(for: .milliseconds(delay))
+                }
+            case "preset":
+                guard let profile = action.value else { throw CheckFailure(message: "preset requires profile") }
+                if profile == "mp4_h264_standard_v1" { model.strategy = .transcodeStandard }
+                else if profile == "mp4_h264_720p_v1" { model.strategy = .transcode720p }
+                else { throw CheckFailure(message: "Unknown fixed preset") }
+            case "audio":
+                switch action.value {
+                case "all_supported": model.audioSelection = .all
+                case "none": model.audioSelection = .none
+                case "one": guard let index = action.streamIndex else { throw CheckFailure(message: "one requires stream_index") }; model.audioSelection = .one(index: index)
+                default: throw CheckFailure(message: "Unknown audio choice")
+                }
+            case "batch":
+                guard let indices = action.indices, let paths = action.destinations,
+                      indices.allSatisfy({ model.assets.indices.contains($0) }) else { throw CheckFailure(message: "batch indices invalid") }
+                let ids = indices.map { model.assets[$0].id }
+                let destinations = try paths.map { try absoluteURL($0) }
+                if action.submissionWait == false {
+                    guard pendingExport == nil else { throw CheckFailure(message: "Pending submission already exists") }
+                    let current = model
+                    pendingExport = Task { await current.submitBatch(assetIDs: ids, destinations: destinations) }
+                    await Task.yield(); useCachedDiagnostics = true
+                } else {
+                    await model.submitBatch(assetIDs: ids, destinations: destinations)
+                    if action.wait != false { await model.awaitQueue() }
+                }
+            case "cancel-pending": model.queueCancelRequested = true; useCachedDiagnostics = true
+            case "await-submission": await pendingExport?.value; pendingExport = nil
+            case "queue-refresh": await model.refreshQueue()
+            case "await-queue": await model.awaitQueue()
+            case "reorder":
+                if action.value == "reverse" { await model.reorderQueue(taskIDs: model.queuedTasks.reversed().map(\.id)) }
+                else {
+                    guard let indices = action.indices, indices.allSatisfy({ model.tasks.indices.contains($0) }) else { throw CheckFailure(message: "reorder indices invalid") }
+                    await model.reorderQueue(taskIDs: indices.map { model.tasks[$0].id })
+                }
+            case "cancel-task", "retry":
+                let task: WorkspaceTask?
+                if let value = action.value { task = model.tasks.first { $0.destinationName == value } }
+                else if let index = action.index, model.tasks.indices.contains(index) { task = model.tasks[index] }
+                else { task = nil }
+                guard let task else { throw CheckFailure(message: "Task not found") }
+                if action.action == "cancel-task" { await model.cancelQueue(taskID: task.id) }
+                else { await model.retryTask(task.id, destination: try absoluteURL(action.destination)); if action.wait != false { await model.awaitQueue() } }
             case "export":
                 guard pendingExport == nil else { throw CheckFailure(message: "Wait for prior export before driving another") }
                 let url = try absoluteURL(action.destination)
@@ -170,10 +235,12 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                     while current.activeExport?.coreJobId == nil && !finished && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
                 } else { await model.export(to: url) }
             case "wait":
+                if model.queueEnabled { await model.awaitQueue() }
                 await pendingExport?.value; pendingExport = nil; await pendingImport?.value; pendingImport = nil
+                if model.queueEnabled { await model.awaitQueue() }
                 for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
             case "cancel": await model.cancel()
-            case "clear-history": model.clearHistory()
+            case "clear-history": if model.queueEnabled { await model.clearQueueHistory() } else { model.clearHistory() }
             case "play": model.preview.togglePlayback(); try await Task.sleep(for: .milliseconds(min(5000, max(0, action.milliseconds ?? 150)))); model.preview.pause()
             case "seek": try await model.preview.seek(normalizedUs: action.positionUs ?? 0)
             case "preview-frame": try await model.preview.writePreviewFrame(to: absoluteURL(action.destination), normalizedUs: action.positionUs ?? 0)
@@ -210,7 +277,7 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                 if action.action == "restart" {
                     steps.append(await workspaceEvidence(model, action: "before-restart"))
                     totalBridge.accumulate(await model.diagnostics()); aggregate(model.accessDiagnostics)
-                    model = WorkspaceModel(historyPath: historyURL)
+                    model = WorkspaceModel(historyPath: historyURL, queueEnabled: CommandLine.arguments.contains("--queue-self-test"))
                 }
             default: throw CheckFailure(message: "Unknown scenario action \(action.action)")
             }

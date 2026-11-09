@@ -36,7 +36,7 @@ struct ShutdownDiagnostics: Codable, Sendable {
     var cleanupElapsedMs = 0.0
     var watchdogElapsedMs: Double?
 }
-private final class SecurityAccess {
+final class SecurityAccess {
     let url: URL
     private var active: Bool
     private(set) var retained = true
@@ -56,8 +56,24 @@ final class WorkspaceModel: ObservableObject {
     static let shared = WorkspaceModel()
     let preview = PreviewController()
     private let probeBridge = CoreBridge()
-    private let exportBridge = CoreBridge()
+    let exportBridge = CoreBridge()
     private let legacyCompatibility: Bool
+    let queueEnabled: Bool
+    let queueSessionId = UUID()
+    @Published var queueSnapshot: QueueSnapshot?
+    @Published var submissionErrors: [QueueRejection] = []
+    @Published var isSubmitting = false
+    @Published var audioSelection: AudioSelection = .all { didSet { saveSelectedEdits() } }
+    var queueRequests: [UUID: ActiveExport] = [:]
+    var queueLeases: [UUID: [SecurityAccess]] = [:]
+    var pendingQueue: PendingQueueSubmission?
+    var queuePollTask: Task<Void, Never>?
+    var queueRefreshInProgress = false
+    var queueCancelRequested = false
+    var queueConfiguration: BackendConfiguration?
+    // An optional observer coordinates integration diagnostics at real async
+    // connection boundaries; it never supplies a job state or media result.
+    var queueSubmissionObserver: ((String) async -> Void)?
     private let recentStore: RecentTaskStore
     @Published var assets: [WorkspaceAsset] = []
     @Published var selectedAssetId: UUID?
@@ -80,7 +96,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var events: [String] = []
     @Published var closed = false
     @Published private(set) var isImporting = false
-    @Published private(set) var isExporting = false
+    @Published var isExporting = false
     @Published private(set) var isConnecting = false
     private(set) var trace: [JobSnapshot] = []
     private(set) var probeSnapshot: JobSnapshot?
@@ -88,8 +104,8 @@ final class WorkspaceModel: ObservableObject {
     private var leases: [UUID: SecurityAccess] = [:]
     private var exportSourceAccess: SecurityAccess?
     private var outputAccess: SecurityAccess?
-    private var resultURLs: [UUID: URL] = [:]
-    private var stopping = false
+    var resultURLs: [UUID: URL] = [:]
+    var stopping = false
     private var updatingSelection = false
     private var selectionToken = UUID()
     private var importToken = UUID()
@@ -98,20 +114,21 @@ final class WorkspaceModel: ObservableObject {
     private var pendingCancel = false
     private var stopImportRequested = false
     private var configured: BackendConfiguration?
-    private var unconfirmedCleanup = false
+    var unconfirmedCleanup = false
     private var shutdownTask: Task<Void, Never>?
     private var shutdownResult: Result<Void, Error>?
     private(set) var shutdownDiagnostics = ShutdownDiagnostics()
     private(set) var cachedBridgeDiagnostics = BridgeDiagnostics()
 
-    init(legacyCompatibility: Bool = false, historyPath: URL? = nil) {
+    init(legacyCompatibility: Bool = false, historyPath: URL? = nil, queueEnabled: Bool = true) {
         self.legacyCompatibility = legacyCompatibility
-        recentStore = RecentTaskStore(path: historyPath)
+        self.queueEnabled = queueEnabled && !legacyCompatibility
+        recentStore = RecentTaskStore(path: historyPath ?? ProcessInfo.processInfo.environment["MEDIASTUDIO_HISTORY_PATH"].map { URL(fileURLWithPath: $0) })
         tasks = legacyCompatibility ? [] : recentStore.load()
         strategy = legacyCompatibility ? .legacyStreamCopy : .streamCopyV1
     }
     var active: Bool { isImporting || isExporting || isConnecting || stopping || unconfirmedCleanup || phase == "close_failed" }
-    var canImport: Bool { !isImporting && !isConnecting && !stopping && !unconfirmedCleanup }
+    var canImport: Bool { !isSubmitting && pendingQueue == nil && !isImporting && !isConnecting && !stopping && !unconfirmedCleanup }
     var canEdit: Bool { mediaInfo != nil && !stopping && !unconfirmedCleanup }
     var hasRunningJob: Bool { isExporting || probeJob != nil }
     var selectedRange: MediaRange? {
@@ -120,9 +137,10 @@ final class WorkspaceModel: ObservableObject {
         return MediaRange(startUs: start, endUs: end)
     }
     var canExport: Bool {
-        guard !isExporting, !isConnecting, !stopping, !unconfirmedCleanup,
+        guard (queueEnabled ? (!isSubmitting && pendingQueue == nil) : !isExporting), !isConnecting, !stopping, !unconfirmedCleanup,
               configured == backendConfiguration, mediaInfo != nil, selectedRange != nil,
-              connection?.capabilities.features[strategy.capabilityKey]?.available == true else { return false }
+              connection?.capabilities.features[strategy.capabilityKey]?.available == true,
+              (strategy.transcodePreset == nil || connection?.capabilities.features["transcode"]?.profiles?.contains(strategy.profile ?? "") == true) else { return false }
         return strategy == .legacyStreamCopy ? mediaInfo?.trimDisplayMetadataSupported != false
             : mediaInfo?.core003DisplayMetadataSupported != false
     }
@@ -130,12 +148,12 @@ final class WorkspaceModel: ObservableObject {
         mediaInfo != nil && selectedRange == nil ? "结束时间必须晚于开始时间，并在媒体时长内；最多输入 6 位小数。" : nil
     }
     var backendConfiguration: BackendConfiguration {
-        let host = BackendConfiguration.hostDefault(core003Enabled: !legacyCompatibility)
+        let host = BackendConfiguration.hostDefault(core003Enabled: !legacyCompatibility, core004Enabled: queueEnabled)
         return BackendConfiguration(ffmpeg: ffmpegPath, ffprobe: ffprobePath, timeoutMs: host.timeoutMs,
                                     maxOutputBytes: host.maxOutputBytes, core003Enabled: !legacyCompatibility,
-                                    accurateReencodeTimeoutMs: host.accurateReencodeTimeoutMs)
+                                    accurateReencodeTimeoutMs: host.accurateReencodeTimeoutMs, core004Enabled: queueEnabled, transcodeTimeoutMs: host.transcodeTimeoutMs)
     }
-    private func updatePhase() {
+    func updatePhase() {
         guard !closed else { phase = "closed"; return }
         if stopping { phase = "closing" }
         else if unconfirmedCleanup { phase = "cleanup_failed" }
@@ -145,30 +163,31 @@ final class WorkspaceModel: ObservableObject {
         else { phase = "idle" }
     }
     private func record(_ text: String) { events.append(text); if events.count > 80 { events.removeFirst() } }
-    private func hold(_ url: URL) -> SecurityAccess {
+    func hold(_ url: URL) -> SecurityAccess {
         let access = SecurityAccess(url); accessDiagnostics.starts += 1; accessDiagnostics.heldLeases += 1
         if access.granted { accessDiagnostics.granted += 1; accessDiagnostics.activeGranted += 1 }
         return access
     }
-    private func release(_ access: SecurityAccess?) {
+    func release(_ access: SecurityAccess?) {
         guard let access, access.retained else { return }
         accessDiagnostics.heldLeases -= 1
         if access.release() == true { accessDiagnostics.stops += 1; accessDiagnostics.activeGranted -= 1 }
     }
-    private func saveSelectedEdits() {
+    func saveSelectedEdits() {
         guard !updatingSelection, let id = selectedAssetId, let i = assets.firstIndex(where: { $0.id == id }) else { return }
-        assets[i].startText = startText; assets[i].endText = endText; assets[i].mode = strategy
+        assets[i].startText = startText; assets[i].endText = endText; assets[i].mode = strategy; assets[i].audioSelection = audioSelection
     }
-    private func persistTasks() {
+    func persistTasks() {
         guard !legacyCompatibility else { return }
         do { try recentStore.save(tasks) }
         catch { record("最近任务摘要未保存，可稍后重试。") }
     }
     func clearHistory() {
+        if queueEnabled { Task { await clearQueueHistory() }; return }
         tasks.removeAll { $0.terminal }; resultURLs = resultURLs.filter { key, _ in tasks.contains { $0.id == key } }
         selectedTaskId = tasks.first?.id; persistTasks(); status = "已清除已完成的最近任务；活动任务仍保留。"
     }
-    private func observe(_ value: JobSnapshot, exportId: UUID? = nil) {
+    func observe(_ value: JobSnapshot, exportId: UUID? = nil) {
         if exportId != nil || (snapshot?.operation != "trim" && !isExporting) { snapshot = value }
         if trace.last?.jobId != value.jobId || trace.last?.state != value.state {
             trace.append(value); if trace.count > 512 { trace.removeFirst() }
@@ -191,7 +210,7 @@ final class WorkspaceModel: ObservableObject {
         default: status = "正在读取任务状态…"
         }
     }
-    private func friendlyError(_ error: JobFailure?) -> String {
+    func friendlyError(_ error: JobFailure?) -> String {
         switch error?.code {
         case "DEPENDENCY_MISSING", "UNSUPPORTED_BACKEND": return "媒体组件或所选编码能力不可用。请检查已安装组件与模式后重新检测。"
         case "INVALID_MEDIA": return "无法读取媒体，文件可能损坏或不完整，请选择其他文件。"
@@ -203,6 +222,8 @@ final class WorkspaceModel: ObservableObject {
         case "TIMEOUT": return "处理超过时限，已请求停止；请在清理确认后缩小区间重试。"
         case "RESOURCE_LIMIT": return "素材超出当前有界处理能力，请使用更小的素材或区间。"
         case "OUT_OF_DISK": return "输出位置空间不足，未交付结果。请释放空间或选择其他位置。"
+        case "SUBMISSION_CONFLICT": return "提交身份与原请求不一致；请保留现场，勿重复新建同一批任务。"
+        case "OUTPUT_CONTRACT_MISMATCH": return "结果与原请求不一致，尚未确认可用输出。"
         case "SOURCE_CHANGED": return "源文件在处理期间变化，请重新导入。"
         case "CLEANUP_FAILED": return "清理尚未确认，已保留文件访问并阻止新任务，请保留现场并重试安全关闭。"
         default: return "处理未完成，请查看详情并修正文件、组件或保存位置。"
@@ -308,7 +329,7 @@ final class WorkspaceModel: ObservableObject {
         guard !stopping, let item = assets.first(where: { $0.id == id }) else { return }
         if saveCurrent { saveSelectedEdits() }; selectionToken = UUID(); let token = selectionToken
         selectedAssetId = id; updatingSelection = true
-        sourceURL = item.url; mediaInfo = item.info; startText = item.startText; endText = item.endText; strategy = item.mode
+        sourceURL = item.url; mediaInfo = item.info; startText = item.startText; endText = item.endText; strategy = item.mode; audioSelection = item.audioSelection
         updatingSelection = false; saveSelectedEdits(); issue = item.failure
         preview.clear()
         if let info = item.info {
@@ -320,7 +341,7 @@ final class WorkspaceModel: ObservableObject {
     }
     func removeAsset(id: UUID) async {
         guard !isImporting, !stopping, !unconfirmedCleanup else { issue = "素材仍在使用或清理中，请稍后移除。"; return }
-        guard activeExport?.draft.assetId != id else { issue = "该素材仍用于活动导出，请等待任务结束后移除。"; return }
+        guard activeExport?.draft.assetId != id, !queueLeases.keys.contains(where: { queueRequests[$0]?.draft.assetId == id }) else { issue = "该素材仍用于活动导出，请等待任务结束后移除。"; return }
         do { try await preview.shutdown() } catch { issue = error.localizedDescription; return }
         let wasSelected = selectedAssetId == id
         release(leases.removeValue(forKey: id)); assets.removeAll { $0.id == id }
@@ -332,13 +353,18 @@ final class WorkspaceModel: ObservableObject {
     private func currentDraft() -> ExportDraft? {
         guard canExport, let id = selectedAssetId, let sourceURL, let range = selectedRange else { return nil }
         return ExportDraft(assetId: id, sourceURL: sourceURL, sourceName: sourceURL.lastPathComponent, range: range,
-                           mode: strategy, configuration: backendConfiguration)
+                           mode: strategy, configuration: backendConfiguration, audioSelection: strategy.transcodePreset == nil ? .all : audioSelection, expectedAudioIndices: mediaInfo?.streams.filter { $0.codecType == "audio" }.map(\.index))
     }
     func export(to url: URL) async {
+        if queueEnabled {
+            guard let draft = currentDraft() else { issue = rangeIssue ?? "当前媒体、模式或组件尚不可导出。"; return }
+            await submitQueue(drafts: [draft], destinations: [url]); await awaitQueue(); return
+        }
         guard let draft = currentDraft() else { issue = rangeIssue ?? "当前媒体、模式或组件尚不可导出。"; return }
         await export(draft: draft, to: url)
     }
     private func export(draft: ExportDraft, to url: URL) async {
+        if queueEnabled { await submitQueue(drafts: [draft], destinations: [url]); return }
         guard !isExporting, !stopping, !unconfirmedCleanup, assets.contains(where: { $0.id == draft.assetId }) else { return }
         let localId = UUID(); isExporting = true; pendingCancel = false; closed = false; issue = nil
         destinationURL = url; snapshot = nil
@@ -391,6 +417,7 @@ final class WorkspaceModel: ObservableObject {
         }
     }
     func cancel() async {
+        if queueEnabled && (isExporting || isSubmitting) { await cancelQueue(); return }
         guard !stopping else { return }
         if isExporting {
             pendingCancel = true
@@ -452,12 +479,21 @@ final class WorkspaceModel: ObservableObject {
         try shutdownResult?.get()
     }
     private func finishShutdown() async throws {
+        // A submission may be suspended between actor calls, or be inside Core
+        // preflight. Keep its owner and leases until the operation has returned.
+        // The outer application watchdog continues to run while this yields.
+        while isSubmitting || queueRefreshInProgress { try await Task.sleep(for: .milliseconds(10)) }
         try await exportBridge.close(); try await probeBridge.close()
         let snapshots = await exportBridge.closedJobSnapshots()
+        if queueEnabled {
+            for value in snapshots { if let item = tasks.first(where: { $0.sessionId == queueSessionId && $0.coreJobId == value.jobId }) { observeQueue(value, taskID: item.id) } }
+        }
         if let exportJob, let value = snapshots.first(where: { $0.jobId == exportJob }), let id = activeExport?.id { observe(value, exportId: id) }
         guard !unconfirmedCleanup else { throw CheckFailure(message: "清理失败仍未确认，请保留现场；不能宣布已安全关闭。") }
         try await preview.shutdown()
         release(exportSourceAccess); exportSourceAccess = nil; release(outputAccess); outputAccess = nil
+        for id in Array(queueLeases.keys) { releaseQueueLeases(id) }; pendingQueue = nil
+        queuePollTask?.cancel(); queuePollTask = nil
         for lease in leases.values { release(lease) }; leases.removeAll()
         activeExport = nil; exportJob = nil; probeJob = nil; isExporting = false; isImporting = false
         closed = true; phase = "closed"; configured = nil; connection = nil; persistTasks()
