@@ -1,12 +1,14 @@
 {
   "schema_version": 0,
-  "core_version": "0.0.0-draft",
+  "core_version": "0.1.0-dev",
   "platform": "example-platform",
+  "mock_only": true,
   "features": {
-    "probe": {"available": true},
-    "trim_stream_copy": {"available": true},
+    "probe": {"available": false, "reason": "not_implemented"},
+    "trim_stream_copy": {"available": false, "reason": "not_implemented"},
     "accurate_reencode": {"available": false, "reason": "not_implemented"},
-    "ai_separation": {"available": false, "reason": "backend_not_installed"}
+    "ai_separation": {"available": false, "reason": "not_implemented"},
+    "mock_job": {"available": true}
   },
-  "media_backend": {"name": "ffmpeg", "version": "example-only"}
+  "media_backend": {"name": "mock", "version": "core-001"}
 }

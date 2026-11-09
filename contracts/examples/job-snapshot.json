@@ -1,9 +1,10 @@
 {
   "schema_version": 0,
-  "job_id": "example-123",
-  "operation": "trim",
+  "job_id": "mock-1",
+  "operation": "mock",
   "state": "running",
-  "progress": {"ratio": 0.42, "is_estimate": true},
+  "mock_only": true,
+  "progress": null,
   "error": null,
   "result": null
 }
