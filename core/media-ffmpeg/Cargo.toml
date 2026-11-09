@@ -6,4 +6,5 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+media-domain.workspace = true
 serde_json.workspace = true

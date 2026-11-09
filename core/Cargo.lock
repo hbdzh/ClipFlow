@@ -37,6 +37,7 @@ dependencies = [
 name = "media-ffmpeg"
 version = "0.1.0-dev"
 dependencies = [
+ "media-domain",
  "serde_json",
 ]
 
