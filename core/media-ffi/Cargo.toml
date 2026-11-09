@@ -1,0 +1,14 @@
+[package]
+name = "media-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+media-domain.workspace = true
+media-orchestrator.workspace = true
+serde_json.workspace = true
