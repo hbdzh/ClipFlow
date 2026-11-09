@@ -33,7 +33,8 @@ final class PreviewController: ObservableObject {
     private var timelineOffsetUs: Int64 = 0
     private var endItemUs: Int64 = 0
     private var periodicObserver: Any?
-    private var loading = false
+    private var loadingCount = 0
+    private var loading: Bool { loadingCount > 0 }
     private var activeAsset: AVURLAsset?
     private var activeGenerator: AVAssetImageGenerator?
     private var imageRequests = 0
@@ -76,8 +77,8 @@ final class PreviewController: ObservableObject {
 
     func load(url: URL, media: MediaInfo) async throws {
         clear()
-        loading = true
-        defer { loading = false }
+        loadingCount += 1
+        defer { loadingCount -= 1 }
         let token = generation
         status = "正在准备预览…"
         diagnostics.status = "loading"
@@ -103,7 +104,8 @@ final class PreviewController: ObservableObject {
         let firstImage: (image: CGImage, actualTime: CMTime)
         do { firstImage = try await generateImage(generator, at: CMTime(value: offset, timescale: 1_000_000)) }
         catch { imageRequests -= 1; throw error }
-        imageRequests -= 1; activeGenerator = nil
+        imageRequests -= 1
+        if token == generation { activeGenerator = nil }
         let firstImageUs = try micros(firstImage.actualTime)
         guard firstImageUs >= offset else { throw CheckFailure(message: "未取得内容区间内的系统预览画面。") }
         guard token == generation else { return }
@@ -188,7 +190,8 @@ final class PreviewController: ObservableObject {
         generator.requestedTimeToleranceBefore = .zero; generator.requestedTimeToleranceAfter = .zero
         let token = generation
         activeGenerator = generator; imageRequests += 1
-        defer { imageRequests -= 1; activeGenerator = nil }
+        defer { imageRequests -= 1
+        if token == generation { activeGenerator = nil } }
         let image = try await generateImage(generator, at: CMTime(value: itemUs, timescale: 1_000_000))
         guard token == generation, ready else { throw CheckFailure(message: "预览测试帧所属媒体已关闭。") }
         diagnostics.imageActualItemUs = try micros(image.actualTime)

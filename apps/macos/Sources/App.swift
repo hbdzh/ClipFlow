@@ -2,38 +2,40 @@ import AppKit
 import Foundation
 import SwiftUI
 
+private func stateLabel(_ state: String) -> String {
+    ["waiting": "待探测", "probing": "探测中", "queued": "等待处理", "running": "处理与校验中", "cancelling": "等待停止与清理", "cancelled": "已取消", "succeeded": "已完成", "failed": "未完成", "interrupted": "上次会话已中断"][state] ?? state
+}
 struct WorkspaceView: View {
     @ObservedObject var model: WorkspaceModel
     @ObservedObject var preview: PreviewController
     @State private var showDetails = false
     @State private var showTools = false
+    @State private var dropTargeted = false
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Image(systemName: "scissors").font(.title2).foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("MediaStudio").font(.title2.bold())
-                    Text("选择片段，保留原始编码").font(.callout).foregroundStyle(.secondary)
+                    Text("macOS 剪辑工作区").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button { model.chooseInput() } label: { Label("导入媒体", systemImage: "plus") }
-                    .keyboardShortcut("o", modifiers: .command).disabled(model.active)
-                    .accessibilityIdentifier("import-media")
+                    .disabled(!model.canImport).accessibilityIdentifier("import-media")
                 Button { showTools.toggle() } label: { Label("媒体组件", systemImage: "gearshape") }
-                    .disabled(model.active)
-            }.padding(20)
+            }.padding(18)
             Divider()
-            ScrollView {
-                HStack(alignment: .top, spacing: 18) {
-                    sourcePanel.frame(width: 205)
-                    VStack(alignment: .leading, spacing: 16) { previewPanel; rangePanel }.frame(maxWidth: .infinity)
-                    exportPanel.frame(width: 270)
-                }.padding(20)
+            HSplitView {
+                sourcePanel.frame(minWidth: 190, idealWidth: 220, maxWidth: 290)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) { previewPanel; rangePanel; exportPanel }.padding(18)
+                }.frame(minWidth: 460, maxWidth: .infinity)
+                taskPanel.frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
             }
             Divider()
             HStack(alignment: .top, spacing: 12) {
                 if model.active { ProgressView().controlSize(.small) }
-                VStack(alignment: .leading, spacing: 5) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(model.status).accessibilityIdentifier("workspace-status")
                     if let issue = model.issue { Text(issue).font(.callout).foregroundStyle(.orange).textSelection(.enabled).accessibilityIdentifier("workspace-error") }
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -41,123 +43,170 @@ struct WorkspaceView: View {
                     Button("重试安全关闭") { Task { try? await model.shutdown() } }
                 }
                 Button("任务详情") { showDetails.toggle() }
-            }.padding(16)
+            }.padding(14)
         }
         .frame(minWidth: 1000, minHeight: 640)
+        .background(dropTargeted ? Color.accentColor.opacity(0.08) : Color.clear)
+        .dropDestination(for: URL.self) { urls, _ in
+            guard model.canImport else { return false }
+            Task { await model.importURLs(urls) }; return true
+        } isTargeted: { dropTargeted = $0 }
         .sheet(isPresented: $showDetails) { detailsSheet }
         .sheet(isPresented: $showTools) { toolsSheet }
+        .background(PlaybackKeyboard(preview: preview))
     }
     private var sourcePanel: some View {
-        VStack(alignment: .leading, spacing: 15) {
-            Text("素材").font(.headline)
-            if let url = model.sourceURL {
-                Label(url.lastPathComponent, systemImage: "film").font(.callout.bold()).textSelection(.enabled)
-                if let info = model.mediaInfo {
-                    Text("\(timeText(info.durationUs)) 秒").monospacedDigit()
-                    Text(info.container).font(.caption).foregroundStyle(.secondary)
-                    Divider()
-                    ForEach(info.streams, id: \.index) { stream in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(stream.codecType == "video" ? "视频轨道 \(stream.index)" : (stream.codecType == "audio" ? "音频轨道 \(stream.index)" : "\(stream.codecType) 轨道 \(stream.index)")).font(.caption.bold())
-                            Text(stream.codecName ?? "未知编码").font(.caption).foregroundStyle(.secondary)
-                            if let width = stream.width, let height = stream.height { Text("\(width) × \(height)").font(.caption) }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Text("素材").font(.headline); Spacer(); Text("\(model.assets.count) / 100").font(.caption).foregroundStyle(.secondary) }
+            if model.assets.isEmpty {
+                ContentUnavailableView { Label("导入媒体", systemImage: "film.stack") } description: { Text("选择多个文件，或拖放到窗口。") }
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 5) {
+                        ForEach(model.assets) { item in
+                            Button { Task { await model.selectAsset(id: item.id) } } label: {
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: "film")
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(item.url.lastPathComponent).font(.callout.weight(.medium)).lineLimit(2)
+                                        Text(item.info.map { timeText($0.durationUs) + " 秒" } ?? stateLabel(item.state)).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                }.padding(9).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(model.selectedAssetId == item.id ? Color.accentColor.opacity(0.16) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+                                    .contentShape(Rectangle())
+                            }.buttonStyle(.plain).accessibilityLabel("素材 \(item.url.lastPathComponent)，\(stateLabel(item.state))")
+                                .accessibilityAddTraits(model.selectedAssetId == item.id ? .isSelected : [])
+                                .contextMenu { Button("移除素材") { Task { await model.removeAsset(id: item.id) } }.disabled(model.isImporting || model.activeExport?.draft.assetId == item.id) }
                         }
                     }
-                } else { Text("等待媒体信息").foregroundStyle(.secondary) }
-                Button("重新导入此文件") { Task { await model.importURL(url) } }.disabled(model.active)
-            } else {
-                Image(systemName: "film.stack").font(.system(size: 34)).foregroundStyle(.secondary).padding(.vertical, 12)
-                Text("导入 MP4 或 MOV 视频。读取媒体信息后可预览和选区。").font(.callout).foregroundStyle(.secondary)
-                Button("选择文件…") { model.chooseInput() }.disabled(model.active)
+                }
+            }
+            if let id = model.selectedAssetId {
+                Button("移除所选素材") { Task { await model.removeAsset(id: id) } }
+                    .disabled(model.isImporting || model.activeExport?.draft.assetId == id).accessibilityIdentifier("remove-asset")
             }
             Divider()
-            Text("保留全部受支持的音轨；当前不提供字幕、转码或 AI 分离。系统预览不等于导出能力。").font(.caption).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity, alignment: .leading)
+            Text("每份素材保留独立区间和模式。单次只运行一项导出，运行中可以切换素材。").font(.caption).foregroundStyle(.secondary)
+            Text("完整转码工作台与 AI 音轨分离将在后续版本提供。").font(.caption).foregroundStyle(.secondary)
+        }.padding(14)
     }
     private var previewPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Text(model.sourceURL?.lastPathComponent ?? "预览").font(.headline).lineLimit(1).help(model.sourceURL?.lastPathComponent ?? "导入媒体后预览")
             ZStack {
-                RoundedRectangle(cornerRadius: 12).fill(.black)
-                NativePreview(player: preview.player).clipShape(RoundedRectangle(cornerRadius: 12))
+                RoundedRectangle(cornerRadius: 10).fill(.black)
+                NativePreview(player: preview.player).clipShape(RoundedRectangle(cornerRadius: 10))
                 if !preview.ready {
                     VStack(spacing: 10) { Image(systemName: "play.rectangle").font(.largeTitle); Text(preview.status).multilineTextAlignment(.center).font(.callout) }
                         .foregroundStyle(.white.opacity(0.8)).padding(24)
                 }
-            }.frame(minHeight: 260, idealHeight: 320, maxHeight: 400).aspectRatio(16/9, contentMode: .fit)
+            }.aspectRatio(16/9, contentMode: .fit).frame(minHeight: 200, maxHeight: 410)
             HStack {
-                Button { preview.togglePlayback() } label: { Label(preview.playing ? "暂停" : "播放", systemImage: preview.playing ? "pause.fill" : "play.fill") }.disabled(!preview.ready)
+                Button { preview.togglePlayback() } label: { Label(preview.playing ? "暂停" : "播放", systemImage: preview.playing ? "pause.fill" : "play.fill") }
+                    .disabled(!preview.ready).help("空格播放/暂停（文本编辑时保留空格）").accessibilityIdentifier("preview-play")
                 Text("\(timeText(preview.positionUs)) / \(timeText(model.mediaInfo?.durationUs ?? 0)) 秒").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
             }
             if let info = model.mediaInfo, info.durationUs > 0 {
                 Slider(value: Binding(get: { Double(preview.positionUs) }, set: { value in
-                    guard let us = Int64(exactly: value.rounded()) else { return }
-                    Task { try? await preview.seek(normalizedUs: us) }
+                    guard let us = Int64(exactly: value.rounded()) else { return }; Task { try? await preview.seek(normalizedUs: us) }
                 }), in: 0...Double(info.durationUs)).disabled(!preview.ready).accessibilityLabel("预览播放位置")
+                Text(info.streams.map { stream in
+                    "\(stream.codecType) \(stream.codecName ?? "未知")" + (stream.width.map { " · \($0)×\(stream.height ?? 0)" } ?? "")
+                }.joined(separator: " / ")).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             }
-            Text("预览位置仅用于选区；流复制的实际起止点由关键帧决定。").font(.caption).foregroundStyle(.secondary)
+            if let info = model.mediaInfo {
+                DisclosureGroup("媒体信息 · Core 探测") {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("容器：\(info.container) · 首视频 PTS：\(info.videoOriginUs) µs · 帧数：\(info.videoFrameCount.map(String.init) ?? "未知")")
+                        ForEach(info.streams, id: \.index) { stream in
+                            Text("轨道 \(stream.index) · \(stream.codecType) · \(stream.codecName ?? "未知") · time_base \(stream.timeBase ?? "未知") · fps \(stream.avgFrameRate ?? "未知") · SAR \(stream.sampleAspectRatio ?? "未知") · \(stream.language ?? "未标语言")" + (stream.channels.map { " · \($0) 声道 / \(stream.sampleRate ?? "未知") Hz" } ?? ""))
+                        }
+                    }.font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            Text("系统预览能力与 Core 导出能力分别检测；预览不可用时仍显示真实媒体信息。").font(.caption).foregroundStyle(.secondary)
         }
     }
     private var rangePanel: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack { Text("选择区间").font(.headline); Spacer(); Button("设为入点") { model.setInPoint() }.disabled(!preview.ready || !model.canEdit); Button("设为出点") { model.setOutPoint() }.disabled(!preview.ready || !model.canEdit) }
                 HStack {
-                    Text("选择区间").font(.headline)
-                    Spacer()
-                    Button("设为入点") { model.setInPoint() }.disabled(!preview.ready || model.active)
-                    Button("设为出点") { model.setOutPoint() }.disabled(!preview.ready || model.active)
-                }
-                HStack {
-                    VStack(alignment: .leading) { Text("开始（秒）").font(.caption); TextField("开始", text: $model.startText).textFieldStyle(.roundedBorder).accessibilityIdentifier("range-start") }
+                    VStack(alignment: .leading) { Text("开始（秒）").font(.caption); TextField("开始", text: $model.startText).textFieldStyle(.roundedBorder).accessibilityIdentifier("range-start").accessibilityLabel("区间开始，秒") }
                     Text("→").foregroundStyle(.secondary)
-                    VStack(alignment: .leading) { Text("结束（秒）").font(.caption); TextField("结束", text: $model.endText).textFieldStyle(.roundedBorder).accessibilityIdentifier("range-end") }
-                }.monospacedDigit().disabled(model.mediaInfo == nil || model.active)
+                    VStack(alignment: .leading) { Text("结束（秒）").font(.caption); TextField("结束", text: $model.endText).textFieldStyle(.roundedBorder).accessibilityIdentifier("range-end").accessibilityLabel("区间结束，秒") }
+                }.monospacedDigit().disabled(!model.canEdit)
                 if let info = model.mediaInfo, info.durationUs > 0 {
-                    Slider(value: Binding(get: { Double(parseTimeText(model.startText) ?? 0) }, set: { value in
-                        if let us = Int64(exactly: value.rounded()) { model.startText = timeText(us) }
-                    }), in: 0...Double(info.durationUs)).accessibilityLabel("区间入点").disabled(model.active)
-                    Slider(value: Binding(get: { Double(parseTimeText(model.endText) ?? info.durationUs) }, set: { value in
-                        if let us = Int64(exactly: value.rounded()) { model.endText = timeText(us) }
-                    }), in: 0...Double(info.durationUs)).accessibilityLabel("区间出点").disabled(model.active)
+                    Slider(value: Binding(get: { Double(parseTimeText(model.startText) ?? 0) }, set: { if let value = Int64(exactly: $0.rounded()) { model.startText = timeText(value) } }), in: 0...Double(info.durationUs)).accessibilityLabel("区间入点").disabled(!model.canEdit)
+                    Slider(value: Binding(get: { Double(parseTimeText(model.endText) ?? info.durationUs) }, set: { if let value = Int64(exactly: $0.rounded()) { model.endText = timeText(value) } }), in: 0...Double(info.durationUs)).accessibilityLabel("区间出点").disabled(!model.canEdit)
                 }
                 if let issue = model.rangeIssue { Text(issue).font(.caption).foregroundStyle(.orange) }
                 else if let range = model.selectedRange { Text("请求保留 \(timeText(range.endUs - range.startUs)) 秒").font(.caption).foregroundStyle(.secondary) }
-            }.padding(8)
+            }.padding(6)
         }
     }
     private var exportPanel: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("导出").font(.headline)
-            Label("快速无损 · 流复制", systemImage: "bolt.fill").font(.callout.bold())
-            Text("不重新编码。实际区间可能向前、向后扩展至完整关键帧；完成后会显示实际范围。").font(.callout).foregroundStyle(.secondary)
-            Text("精确裁剪需要重编码，当前未开放。").font(.caption).foregroundStyle(.secondary)
-            Button { model.chooseOutput() } label: { Label("选择位置并导出…", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity) }
-                .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command)
-                .disabled(!model.canExport).accessibilityIdentifier("export-media")
-            if model.active {
-                Button("取消任务") { Task { await model.cancel() } }
-                    .disabled(!["probing", "exporting"].contains(model.phase) || model.snapshot?.state == "cancelling")
-                    .accessibilityIdentifier("cancel-job")
+        VStack(alignment: .leading, spacing: 10) {
+            Text("导出模式").font(.headline)
+            Picker("导出模式", selection: $model.strategy) {
+                Text("快速 · 无损流复制").tag(ExportStrategy.streamCopyV1)
+                Text("精确 · 有损重编码").tag(ExportStrategy.accurateReencode)
+            }.pickerStyle(.segmented).disabled(!model.canEdit).accessibilityIdentifier("export-strategy")
+            Text(model.strategy.isReencoded ? "精确 P01：按所选区间重新编码 H.264 / AAC。画质有损，输出经 Core 校验后才交付。" : "快速 copy-v1：保留原编码，实际范围可扩展至关键帧；完成后比较请求与实际范围。")
+                .font(.callout).foregroundStyle(.secondary)
+            if model.connection?.capabilities.features[model.strategy.capabilityKey]?.available != true {
+                Text("该模式当前不可用；请在“媒体组件”重新检测能力。").font(.caption).foregroundStyle(.orange)
+            } else if model.mediaInfo?.core003DisplayMetadataSupported == false {
+                Text("此素材的显示元数据不在当前 Core 支持范围内，导出已禁用。").font(.caption).foregroundStyle(.orange)
             }
-            Divider()
-            if let snapshot = model.snapshot {
-                Text(snapshot.operation == "probe" ? "探测任务" : "导出任务").font(.caption.bold())
-
-                Text(stateLabel(snapshot.state)).font(.callout)
-                if let failure = snapshot.error { Text(failure.code).font(.caption).foregroundStyle(.secondary) }
-                if snapshot.state == "succeeded", let result = snapshot.result, result.fileCreated {
-                    Label("输出已通过校验", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                    if let requested = result.requestedRangeUs { Text("请求：\(timeText(requested.startUs))–\(timeText(requested.endUs)) 秒").font(.caption.monospacedDigit()) }
-                    if let actual = result.actualRangeUs { Text("实际：\(timeText(actual.startUs))–\(timeText(actual.endUs)) 秒").font(.caption.monospacedDigit()).accessibilityIdentifier("actual-range") }
-                    if let destination = model.destinationURL { Text(destination.lastPathComponent).font(.caption).textSelection(.enabled) }
-                    HStack { Button("打开结果") { model.openResult() }; Button("在 Finder 显示") { model.revealResult() } }
-                    Text("已检查轨道、解码、帧/包连续性与时序；不代表已完成人工音画或所有元数据验收。").font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button { model.chooseOutput() } label: { Label("选择位置并导出…", systemImage: "square.and.arrow.up") }
+                    .buttonStyle(.borderedProminent).disabled(!model.canExport).accessibilityIdentifier("export-media")
+                if model.isExporting || model.isImporting {
+                    Button("取消当前任务") { Task { await model.cancel() } }.disabled(model.snapshot?.state == "cancelling").accessibilityIdentifier("cancel-job")
                 }
-            } else { Text("提交后可在这里查看任务状态、取消和结果。").font(.callout).foregroundStyle(.secondary) }
-        }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let active = model.activeExport {
+                Text("正在导出：\(active.draft.sourceName) · \(timeText(active.draft.range.startUs))–\(timeText(active.draft.range.endUs)) 秒 · \(active.draft.mode.title)")
+                    .font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("active-export-source")
+            }
+        }
     }
-    private func stateLabel(_ state: String) -> String {
-        ["queued": "等待处理", "running": "处理中与校验中", "cancelling": "等待停止与清理", "cancelled": "已取消", "succeeded": "已完成", "failed": "未完成"][state] ?? state
+    private var taskPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Text("任务与结果").font(.headline); Spacer(); Button("清除记录") { model.clearHistory() }.disabled(!model.tasks.contains(where: { $0.terminal })) }
+            Text("本机最近 100 条摘要；重启不续跑任务。").font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if model.tasks.isEmpty { Text("导出任务提交到 Core 后显示在这里。").font(.callout).foregroundStyle(.secondary).padding(.vertical, 16) }
+                    ForEach(model.tasks) { item in
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(item.sourceName).font(.callout.bold()).lineLimit(2)
+                            HStack { Image(systemName: item.state == "succeeded" ? "checkmark.circle.fill" : "clock"); Text(stateLabel(item.state)) }.font(.caption).foregroundStyle(item.state == "succeeded" ? Color.green : Color.secondary)
+                            Text("请求：" + item.mode.title).font(.caption)
+                            if let result = item.result, let actualMode = result.exportStrategy {
+                                Text("Core 结果：" + (actualMode.isReencoded ? "有损重编码" : "无损流复制") + " · " + (result.profile ?? "兼容配置")).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Text("请求：\(timeText(item.requestedRange.startUs))–\(timeText(item.requestedRange.endUs)) 秒").font(.caption.monospacedDigit())
+                            if let actual = item.actualRange { Text("实际：\(timeText(actual.startUs))–\(timeText(actual.endUs)) 秒").font(.caption.monospacedDigit()).accessibilityIdentifier("actual-range") }
+                            Text(item.destinationName).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            if let error = item.failure { Text(error.code).font(.caption).foregroundStyle(.orange) }
+                            if item.state == "succeeded" {
+                                HStack { Button("打开") { model.openResult(taskId: item.id) }; Button("在 Finder 显示") { model.revealResult(taskId: item.id) } }.controlSize(.small)
+                                Button("重新授权文件…") { model.reauthorizeResult(taskId: item.id) }.controlSize(.small)
+                                Text(item.result == nil ? "历史摘要；文件访问需有效授权。" : "已通过 Core 输出校验。").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            if item.interrupted { Text("上次会话未确认完成；请重新导入并手动提交。").font(.caption).foregroundStyle(.orange) }
+                        }.padding(11).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 9))
+                            .accessibilityElement(children: .contain)
+                    }
+                }
+            }
+            Text("校验包含内容、时序与解码检查；人工音画与完整元数据验收另行记录。").font(.caption).foregroundStyle(.secondary)
+        }.padding(14)
     }
     private var detailsSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -167,7 +216,7 @@ struct WorkspaceView: View {
                 if let failure = snapshot.error { Text("\(failure.code)：\(failure.message)").textSelection(.enabled) }
             }
             ScrollView { VStack(alignment: .leading, spacing: 8) { ForEach(Array(model.events.enumerated()), id: \.offset) { _, event in Text(event).font(.caption.monospaced()).frame(maxWidth: .infinity, alignment: .leading) } } }
-            Text("失败/取消以 Core 终态为准；清理失败不会显示已取消。").font(.caption).foregroundStyle(.secondary)
+            Text("失败/取消以 Core 终态为准；清理未确认时保留访问并阻止新任务。").font(.caption).foregroundStyle(.secondary)
             Button("完成") { showDetails = false }.keyboardShortcut(.cancelAction)
         }.padding(24).frame(width: 620, height: 420)
     }
@@ -175,15 +224,38 @@ struct WorkspaceView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("媒体组件").font(.title2.bold())
             Text("本地开发版本使用您已安装的 FFmpeg / ffprobe 7.x；此机只验收过 7.1.1。不会自动下载或随包分发组件。").font(.callout)
-            HStack { Text("FFmpeg").frame(width: 70, alignment: .leading); TextField("绝对路径", text: $model.ffmpegPath).disabled(model.active); Button("选择…") { model.chooseTool(ffmpeg: true) } }
-            HStack { Text("ffprobe").frame(width: 70, alignment: .leading); TextField("绝对路径", text: $model.ffprobePath).disabled(model.active); Button("选择…") { model.chooseTool(ffmpeg: false) } }
-            Text("首次默认检查 /opt/homebrew/bin，或使用启动时的组件环境配置；修改后请重新检测。应用尚未验收沙盒或正式分发。").font(.caption).foregroundStyle(.secondary)
+            HStack { Text("FFmpeg").frame(width: 70, alignment: .leading); TextField("绝对路径", text: $model.ffmpegPath).disabled(model.active); Button("选择…") { model.chooseTool(ffmpeg: true) }.disabled(model.active) }
+            HStack { Text("ffprobe").frame(width: 70, alignment: .leading); TextField("绝对路径", text: $model.ffprobePath).disabled(model.active); Button("选择…") { model.chooseTool(ffmpeg: false) }.disabled(model.active) }
+            Text("组件能力由 Core 检测；修改路径后重新检测。应用尚未验收沙盒或正式分发。").font(.caption).foregroundStyle(.secondary)
             if let connection = model.connection { Text("Core \(connection.version.coreVersion) · \(connection.capabilities.mediaBackend.ffmpegVersion ?? "不可用")").font(.caption) }
             HStack { Button("重新检测") { Task { await model.connect() } }.disabled(model.active); Spacer(); Button("完成") { showTools = false }.keyboardShortcut(.cancelAction) }
         }.padding(24).frame(width: 680)
     }
 }
-
+// A local monitor leaves text editing and accessibility keyboard navigation with AppKit.
+private struct PlaybackKeyboard: NSViewRepresentable {
+    let preview: PreviewController
+    func makeCoordinator() -> Coordinator { Coordinator(preview) }
+    func makeNSView(context: Context) -> NSView { context.coordinator.install(); return NSView() }
+    func updateNSView(_ view: NSView, context: Context) {}
+    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) { coordinator.remove() }
+    @MainActor final class Coordinator {
+        private let preview: PreviewController
+        private var monitor: Any?
+        init(_ preview: PreviewController) { self.preview = preview }
+        func install() {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                let handled = MainActor.assumeIsolated {
+                    guard let self, event.keyCode == 49, event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                          !(NSApp.keyWindow?.firstResponder is NSTextView), self.preview.ready else { return false }
+                    self.preview.togglePlayback(); return true
+                }
+                return handled ? nil : event
+            }
+        }
+        func remove() { if let monitor { NSEvent.removeMonitor(monitor) }; monitor = nil }
+    }
+}
 @MainActor
 final class WorkspaceDelegate: NSObject, NSApplicationDelegate {
     private var closingWindow: NSWindow?
@@ -199,46 +271,45 @@ final class WorkspaceDelegate: NSObject, NSApplicationDelegate {
             do { try await WorkspaceModel.shared.shutdown(); sender.reply(toApplicationShouldTerminate: true) }
             catch {
                 sender.reply(toApplicationShouldTerminate: false)
-                // Last-window close can arrive before termination. Keep a strong
-                // reference to restore the actual workspace on cleanup failure.
                 let window = closingWindow ?? sender.windows.first { $0.canBecomeMain }
-                window?.makeKeyAndOrderFront(nil)
-                sender.activate()
-                let alert = NSAlert()
-                alert.messageText = "关闭尚未确认"
-                alert.informativeText = WorkspaceModel.shared.issue ?? error.localizedDescription
+                window?.makeKeyAndOrderFront(nil); sender.activate()
+                let alert = NSAlert(); alert.messageText = "关闭尚未确认"; alert.informativeText = WorkspaceModel.shared.issue ?? error.localizedDescription
                 alert.addButton(withTitle: "返回工作区")
-                if let window { await alert.beginSheetModal(for: window) }
-                else { alert.runModal() }
+                if let window { await alert.beginSheetModal(for: window) } else { alert.runModal() }
             }
         }
         return .terminateLater
     }
 }
 struct MediaStudioSpikeApp: App {
+    @ObservedObject private var model = WorkspaceModel.shared
     @NSApplicationDelegateAdaptor(WorkspaceDelegate.self) private var delegate
     var body: some Scene {
         Window("MediaStudio", id: "workspace") { WorkspaceView(model: .shared, preview: WorkspaceModel.shared.preview) }
             .windowResizability(.contentMinSize).defaultSize(width: 1280, height: 800)
+            .commands {
+                CommandGroup(after: .newItem) {
+                    Button("导入媒体…") { WorkspaceModel.shared.chooseInput() }.keyboardShortcut("o", modifiers: .command).disabled(!model.canImport)
+                    Button("导出所选区间…") { WorkspaceModel.shared.chooseOutput() }.keyboardShortcut(.return, modifiers: .command).disabled(!model.canExport)
+                }
+            }
     }
 }
-
-@main
-struct EntryPoint {
+@main struct EntryPoint {
     @MainActor static func main() async {
         do {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; encoder.keyEncodingStrategy = .convertToSnakeCase
             if CommandLine.arguments.contains("--self-test") {
-                let report = try await runSelfTest()
-                FileHandle.standardOutput.write(try encoder.encode(report)); FileHandle.standardOutput.write(Data("\n".utf8)); exit(0)
+                let report = try await runSelfTest(); FileHandle.standardOutput.write(try encoder.encode(report)); FileHandle.standardOutput.write(Data("\n".utf8)); exit(0)
             }
             if CommandLine.arguments.contains("--media-self-test") {
-                let report = try await runMediaSelfTest()
-                FileHandle.standardOutput.write(try encoder.encode(report)); FileHandle.standardOutput.write(Data("\n".utf8)); exit(report.passed ? 0 : 1)
+                let report = try await runMediaSelfTest(); FileHandle.standardOutput.write(try encoder.encode(report)); FileHandle.standardOutput.write(Data("\n".utf8)); exit(report.passed ? 0 : 1)
             }
-        } catch {
-            FileHandle.standardError.write(Data("MediaStudio self-test failed: \(error.localizedDescription)\n".utf8)); exit(1)
-        }
+            if CommandLine.arguments.contains("--workspace-self-test") {
+                let workspaceEncoder = JSONEncoder(); workspaceEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let report = try await runWorkspaceSelfTest(); FileHandle.standardOutput.write(try workspaceEncoder.encode(report)); FileHandle.standardOutput.write(Data("\n".utf8)); exit(report.passed ? 0 : 1)
+            }
+        } catch { FileHandle.standardError.write(Data("MediaStudio self-test failed: \(error.localizedDescription)\n".utf8)); exit(1) }
         MediaStudioSpikeApp.main()
     }
 }

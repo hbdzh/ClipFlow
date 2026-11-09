@@ -1,0 +1,234 @@
+import AppKit
+import Foundation
+
+private struct WorkspaceScenario: Decodable {
+    let schemaVersion: Int
+    let historyPath: String
+    let actions: [WorkspaceAction]
+}
+private struct WorkspaceAction: Decodable {
+    let action: String
+    var paths: [String]?
+    var index: Int?
+    var startUs: Int64?
+    var endUs: Int64?
+    var value: String?
+    var destination: String?
+    var wait: Bool?
+    var positionUs: Int64?
+    var milliseconds: Int?
+    var ffmpeg: String?
+    var ffprobe: String?
+    var path: String?
+    var contains: String?
+}
+struct WorkspaceAssetEvidence: Encodable, Sendable {
+    let id: UUID
+    let sourceName: String
+    let state: String
+    let range: MediaRange?
+    let startText: String
+    let endText: String
+    let mode: ExportStrategy
+    let mediaInfo: MediaInfo?
+    let error: String?
+}
+struct WorkspaceTaskEvidence: Encodable, Sendable {
+    let id: UUID
+    let sourceAssetId: UUID
+    let sourceName: String
+    let destinationName: String
+    let mode: ExportStrategy
+    let requestedRange: MediaRange
+    let coreJobId: String?
+    let state: String
+    let actualRange: MediaRange?
+    let error: JobFailure?
+    let result: JobResult?
+    let interrupted: Bool
+}
+struct WorkspaceStepEvidence: Encodable, Sendable {
+    let action: String
+    let phase: String
+    let assets: [WorkspaceAssetEvidence]
+    let selectedAssetId: UUID?
+    let activeExport: ActiveExport?
+    let tasks: [WorkspaceTaskEvidence]
+    let core: JobSnapshot?
+    let trace: [JobSnapshot]
+    let preview: PreviewDiagnostics
+    let bridgeDiagnostics: BridgeDiagnostics
+    let accessDiagnostics: AccessDiagnostics
+    let error: String?
+    let closed: Bool
+    let shutdownDiagnostics: ShutdownDiagnostics
+    let actionWallTimeMs: Double?
+    let canImport: Bool
+    let canExport: Bool
+}
+struct WorkspaceSelfTestReport: Encodable, Sendable {
+    let schemaVersion = 1
+    let scope = "MAC-002 same production WorkspaceModel/CoreBridge/AVFoundation; scenario driver, no simulated job or media success"
+    let passed: Bool
+    let steps: [WorkspaceStepEvidence]
+    let heartbeatCount: Int
+    let heartbeatMaxIntervalMs: Double
+    let bridgeDiagnostics: BridgeDiagnostics
+    let accessDiagnostics: AccessDiagnostics
+    let closed: Bool
+}
+@MainActor
+private func workspaceEvidence(_ model: WorkspaceModel, action: String, cachedDiagnostics: Bool = false, actionWallTimeMs: Double? = nil) async -> WorkspaceStepEvidence {
+    let bridgeDiagnostics = cachedDiagnostics ? model.cachedBridgeDiagnostics : await model.diagnostics()
+    return WorkspaceStepEvidence(action: action, phase: model.phase, assets: model.assets.map { asset in
+        let range: MediaRange?
+        if let start = parseTimeText(asset.startText), let end = parseTimeText(asset.endText), end > start { range = MediaRange(startUs: start, endUs: end) } else { range = nil }
+        return WorkspaceAssetEvidence(id: asset.id, sourceName: asset.url.lastPathComponent, state: asset.state, range: range,
+            startText: asset.startText, endText: asset.endText, mode: asset.mode, mediaInfo: asset.info, error: asset.failure)
+    }, selectedAssetId: model.selectedAssetId, activeExport: model.activeExport, tasks: model.tasks.map { task in
+        WorkspaceTaskEvidence(id: task.id, sourceAssetId: task.sourceAssetId, sourceName: task.sourceName, destinationName: task.destinationName,
+            mode: task.mode, requestedRange: task.requestedRange, coreJobId: task.coreJobId, state: task.state,
+            actualRange: task.actualRange, error: task.failure, result: task.result, interrupted: task.interrupted)
+    }, core: model.snapshot, trace: model.trace, preview: model.preview.diagnostics, bridgeDiagnostics: bridgeDiagnostics,
+       accessDiagnostics: model.accessDiagnostics, error: model.issue, closed: model.closed,
+       shutdownDiagnostics: model.shutdownDiagnostics, actionWallTimeMs: actionWallTimeMs, canImport: model.canImport, canExport: model.canExport)
+}
+@MainActor
+func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
+    _ = NSApplication.shared
+    let args = CommandLine.arguments
+    guard let index = args.firstIndex(of: "--scenario"), index + 1 < args.count, args[index + 1].hasPrefix("/") else {
+        throw CheckFailure(message: "--workspace-self-test requires --scenario /absolute/scenario.json")
+    }
+    let scenarioURL = URL(fileURLWithPath: args[index + 1])
+    let size = try scenarioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+    guard size <= 1_000_000 else { throw CheckFailure(message: "Scenario exceeds 1MB bound") }
+    let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let scenario = try decoder.decode(WorkspaceScenario.self, from: Data(contentsOf: scenarioURL))
+    guard scenario.schemaVersion == 1, scenario.historyPath.hasPrefix("/"), scenario.actions.count <= 500 else {
+        throw CheckFailure(message: "Scenario schema/version/action bound invalid")
+    }
+    let historyURL = URL(fileURLWithPath: scenario.historyPath)
+    var model = WorkspaceModel(historyPath: historyURL)
+    var heartbeatCount = 0
+    var maxInterval = 0.0
+    var lastHeartbeat = ContinuousClock.now
+    let heartbeat = Task { @MainActor in
+        while !Task.isCancelled {
+            let now = ContinuousClock.now
+            let duration = lastHeartbeat.duration(to: now).components
+            maxInterval = max(maxInterval, Double(duration.seconds) * 1000 + Double(duration.attoseconds) / 1_000_000_000_000_000)
+            lastHeartbeat = now; heartbeatCount += 1
+            do { try await Task.sleep(for: .milliseconds(20)) } catch { break }
+        }
+    }
+    var pendingExport: Task<Void, Never>?
+    var pendingImport: Task<Void, Never>?
+    var pendingSelections: [Task<Void, Never>] = []
+    var steps: [WorkspaceStepEvidence] = []
+    var totalBridge = BridgeDiagnostics()
+    var totalAccess = AccessDiagnostics()
+    func absoluteURL(_ path: String?) throws -> URL {
+        guard let path, path.hasPrefix("/") else { throw CheckFailure(message: "Action requires an absolute file path") }
+        return URL(fileURLWithPath: path)
+    }
+    func aggregate(_ access: AccessDiagnostics) {
+        totalAccess.starts += access.starts; totalAccess.granted += access.granted
+        totalAccess.stops += access.stops; totalAccess.activeGranted += access.activeGranted; totalAccess.heldLeases += access.heldLeases
+    }
+    do {
+        for action in scenario.actions {
+            var useCachedDiagnostics = false
+            var actionWallTimeMs: Double?
+            switch action.action {
+            case "import":
+                guard let paths = action.paths, paths.count <= 1000, pendingImport == nil else { throw CheckFailure(message: "Invalid/concurrent import action") }
+                let urls = try paths.map { try absoluteURL($0) }
+                if action.wait == false { let current = model; pendingImport = Task { await current.importURLs(urls) }; await Task.yield() }
+                else { await model.importURLs(urls) }
+            case "select", "remove":
+                guard let index = action.index, model.assets.indices.contains(index) else { throw CheckFailure(message: "Asset index outside current list") }
+                let id = model.assets[index].id
+                if action.action == "select" {
+                    if action.wait == false { let current = model; pendingSelections.append(Task { await current.selectAsset(id: id) }); await Task.yield() }
+                    else { await model.selectAsset(id: id) }
+                } else { await model.removeAsset(id: id) }
+            case "range":
+                guard let start = action.startUs, let end = action.endUs else { throw CheckFailure(message: "Range action requires start_us/end_us") }
+                model.startText = timeText(start); model.endText = timeText(end)
+            case "mode":
+                guard let raw = action.value, let mode = ExportStrategy(rawValue: raw), mode != .legacyStreamCopy else { throw CheckFailure(message: "Workspace supports streamCopyV1 or accurateReencode") }
+                model.strategy = mode
+            case "export":
+                guard pendingExport == nil else { throw CheckFailure(message: "Wait for prior export before driving another") }
+                let url = try absoluteURL(action.destination)
+                if action.wait == false {
+                    let current = model
+                    var finished = false
+                    pendingExport = Task { await current.export(to: url); finished = true }
+                    let deadline = ContinuousClock.now + .seconds(20)
+                    while current.activeExport?.coreJobId == nil && !finished && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                } else { await model.export(to: url) }
+            case "wait":
+                await pendingExport?.value; pendingExport = nil; await pendingImport?.value; pendingImport = nil
+                for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
+            case "cancel": await model.cancel()
+            case "clear-history": model.clearHistory()
+            case "play": model.preview.togglePlayback(); try await Task.sleep(for: .milliseconds(min(5000, max(0, action.milliseconds ?? 150)))); model.preview.pause()
+            case "seek": try await model.preview.seek(normalizedUs: action.positionUs ?? 0)
+            case "preview-frame": try await model.preview.writePreviewFrame(to: absoluteURL(action.destination), normalizedUs: action.positionUs ?? 0)
+            case "sleep": try await Task.sleep(for: .milliseconds(min(5000, max(0, action.milliseconds ?? 20))))
+            case "configure":
+                if let ffmpeg = action.ffmpeg { model.ffmpegPath = ffmpeg }
+                if let ffprobe = action.ffprobe { model.ffprobePath = ffprobe }
+                await model.connect()
+            case "wait-observation":
+                let url = try absoluteURL(action.path)
+                let deadline = ContinuousClock.now + .seconds(20)
+                while ContinuousClock.now < deadline {
+                    if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 1_000_000,
+                       let text = try? String(contentsOf: url, encoding: .utf8), text.contains(action.contains ?? "") { break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                guard let text = try? String(contentsOf: url, encoding: .utf8), text.contains(action.contains ?? "") else { throw CheckFailure(message: "Observation deadline exceeded") }
+            case "connect": await model.connect()
+            case "shutdown-expect-timeout":
+                let started = ContinuousClock.now
+                do {
+                    try await model.shutdown()
+                    throw CheckFailure(message: "Expected global shutdown watchdog did not expire")
+                } catch {
+                    guard model.shutdownDiagnostics.watchdogTimeouts > 0, model.shutdownDiagnostics.cleanupPending,
+                          !model.closed else { throw error }
+                }
+                let elapsed = started.duration(to: .now).components
+                actionWallTimeMs = Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1_000_000_000_000_000
+                useCachedDiagnostics = true
+            case "restart", "shutdown", "await-shutdown":
+                try await model.shutdown(); await pendingExport?.value; pendingExport = nil; await pendingImport?.value; pendingImport = nil
+                for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
+                if action.action == "restart" {
+                    steps.append(await workspaceEvidence(model, action: "before-restart"))
+                    totalBridge.accumulate(await model.diagnostics()); aggregate(model.accessDiagnostics)
+                    model = WorkspaceModel(historyPath: historyURL)
+                }
+            default: throw CheckFailure(message: "Unknown scenario action \(action.action)")
+            }
+            steps.append(await workspaceEvidence(model, action: action.action, cachedDiagnostics: useCachedDiagnostics, actionWallTimeMs: actionWallTimeMs))
+        }
+        if !model.closed { try await model.shutdown() }
+        await pendingExport?.value; await pendingImport?.value
+        for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
+        steps.append(await workspaceEvidence(model, action: "final-shutdown"))
+        totalBridge.accumulate(await model.diagnostics()); aggregate(model.accessDiagnostics)
+    } catch {
+        try? await model.shutdown(); await pendingExport?.value; await pendingImport?.value
+        for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
+        heartbeat.cancel(); await heartbeat.value; throw error
+    }
+    heartbeat.cancel(); await heartbeat.value
+    let passed = model.closed && totalBridge.allCallsOffMainThread && totalBridge.outputCalls == totalBridge.bufferReleaseCalls
+        && totalAccess.activeGranted == 0 && totalAccess.heldLeases == 0 && totalAccess.granted == totalAccess.stops
+    return WorkspaceSelfTestReport(passed: passed, steps: steps, heartbeatCount: heartbeatCount, heartbeatMaxIntervalMs: maxInterval,
+                                  bridgeDiagnostics: totalBridge, accessDiagnostics: totalAccess, closed: model.closed)
+}

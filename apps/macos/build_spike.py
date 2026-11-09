@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a host-only UI-001 native app bundle without external build dependencies."""
+"""Build a host-only MAC-002 native app bundle without external build dependencies."""
 from pathlib import Path
 import hashlib
 import json
@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 BUILD = HERE / 'build'
 APP = BUILD / 'MediaStudioSpike.app'
-RECORD = HERE / 'evidence' / 'ui-001' / 'build.json'
+RECORD = HERE / 'evidence' / 'mac-002' / 'build.json'
 
 
 class UnsafeBuildPath(ValueError):
@@ -144,7 +144,7 @@ def main():
         run(argv)
     artifacts = [{'path': str(p.relative_to(ROOT)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest(),
                   'bytes': p.stat().st_size, 'committed': False} for p in [source, library, binary]]
-    write_record({'result': 'PASS', 'scope': 'UI-001 host arm64-macosx27.0 workspace, not product minimum OS or distribution',
+    write_record({'result': 'PASS', 'scope': 'MAC-002 host arm64-macosx27.0 workspace, not product minimum OS or distribution',
                                  'signing': 'ad-hoc only; no identity/certificate/notarization',
                                  'canonical_header_sha256': hashlib.sha256(header.read_bytes()).hexdigest(),
                                  'commands': commands, 'artifacts': artifacts})

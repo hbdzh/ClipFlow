@@ -7,7 +7,7 @@ struct CoreVersion: Codable, Sendable {
     let stage: String
     let mockOnly: Bool
 }
-struct CoreFeature: Codable, Sendable { let available: Bool; let reason: String? }
+struct CoreFeature: Codable, Sendable { let available: Bool; let reason: String?; let profile: String? }
 struct MediaBackend: Codable, Sendable {
     let name: String
     let version: String?
@@ -32,6 +32,11 @@ struct MediaStream: Codable, Sendable {
     let height: Int?
     let sampleRate: String?
     let channels: Int?
+    let language: String?
+    let profile: String?
+    let rFrameRate: String?
+    let avgFrameRate: String?
+    let sampleAspectRatio: String?
 }
 struct MediaInfo: Codable, Sendable {
     let container: String
@@ -39,25 +44,107 @@ struct MediaInfo: Codable, Sendable {
     let durationUs: Int64
     let videoFrameCount: Int?
     let trimDisplayMetadataSupported: Bool?
+    let core003DisplayMetadataSupported: Bool?
     let streams: [MediaStream]
 }
 struct MediaRange: Codable, Sendable {
     let startUs: Int64
     let endUs: Int64
 }
+// A presentation selection only. Core owns every codec/range/FFmpeg decision.
+enum ExportStrategy: String, Codable, CaseIterable, Sendable {
+    case legacyStreamCopy
+    case streamCopyV1
+    case accurateReencode
+    var title: String {
+        switch self {
+        case .legacyStreamCopy: return "快速无损 · 兼容流复制"
+        case .streamCopyV1: return "快速无损 · 流复制"
+        case .accurateReencode: return "精确裁剪 · 重编码"
+        }
+    }
+    var capabilityKey: String {
+        switch self {
+        case .legacyStreamCopy: return "trim_stream_copy"
+        case .streamCopyV1: return "trim_stream_copy_v1"
+        case .accurateReencode: return "accurate_reencode"
+        }
+    }
+    var profile: String? {
+        switch self {
+        case .legacyStreamCopy: return nil
+        case .streamCopyV1: return "mp4_h264_copy_v1"
+        case .accurateReencode: return "mp4_h264_standard_v1"
+        }
+    }
+    var wireStrategy: String { self == .accurateReencode ? "accurate_reencode" : "stream_copy" }
+    var isReencoded: Bool { self == .accurateReencode }
+}
+
+struct AccuratePlan: Codable, Sendable {
+    let sourceTimeBase: String
+    let sourceFirstFrameIndex: Int
+    let sourceEndFrameIndexExclusive: Int
+    let actualStartPts: Int64
+    let actualEndExclusivePts: Int64
+    let commonOutputOriginSourcePts: Int64
+    let videoEncoder: String
+    let qualityCrf: Int
+    let preset: String
+    let lossless: Bool
+}
+struct VideoQualityValidation: Codable, Sendable {
+    let comparedFrames: Int
+    let reference: String
+    let minimumPlanePsnrDb: Int
+}
+struct AudioContentValidation: Codable, Sendable {
+    let method: String
+    let comparisonSampleRate: Int
+    let allTracksCompared: Int
+    let fullFrequencyOrPerceptualFidelityVerified: Bool
+}
 struct OutputValidation: Codable, Sendable {
+    // These are present in both accepted output contracts and stay required.
     let allStreamsRetained: Bool
-    let completeSourceFrameSequence: Bool
     let verifiedVideoFrames: Int
-    let compressedPacketPayloadsFromSource: Bool
     let decodeAllStreams: Bool
     let packetDtsMonotonic: Bool
-    let allStreamPacketSequencesContiguous: Bool
-    let sourceRelativePacketTimestamps: Bool
-    let packetTimestampToleranceUs: Int64
-    let audioVideoEndDifferenceUs: Int64
     let perceptualAvSyncVerified: Bool
     let sourceIdentityUnchanged: Bool
+    // Source-payload equality applies only to stream copy, never lossy output.
+    let completeSourceFrameSequence: Bool?
+    let compressedPacketPayloadsFromSource: Bool?
+    let allStreamPacketSequencesContiguous: Bool?
+    let sourceRelativePacketTimestamps: Bool?
+    let packetTimestampToleranceUs: Int64?
+    let audioVideoEndDifferenceUs: Int64?
+    let core003ScopeVerified: Bool?
+    // Accurate output supplies a different set of content/time evidence.
+    let decodedPresentationPtsMonotonic: Bool?
+    let verifiedOutputPacketCount: Int?
+    let videoTimestampToleranceUs: Int64?
+    let audioMappingMaximumErrorUs: Int64?
+    let fullColourFidelityVerified: Bool?
+    let videoQuality: VideoQualityValidation?
+    let audioBandlimitedContent: AudioContentValidation?
+
+    func hasRequiredEvidence(for strategy: ExportStrategy) -> Bool {
+        guard allStreamsRetained, verifiedVideoFrames > 0, decodeAllStreams,
+              packetDtsMonotonic, sourceIdentityUnchanged else { return false }
+        if strategy == .accurateReencode {
+            // Presence is mandatory; numeric media acceptance remains in Core.
+            return decodedPresentationPtsMonotonic == true
+                && (verifiedOutputPacketCount ?? 0) > 0
+                && videoTimestampToleranceUs != nil && audioMappingMaximumErrorUs != nil
+                && videoQuality?.comparedFrames == verifiedVideoFrames
+                && audioBandlimitedContent != nil && fullColourFidelityVerified != nil
+        }
+        return completeSourceFrameSequence == true && compressedPacketPayloadsFromSource == true
+            && allStreamPacketSequencesContiguous == true && sourceRelativePacketTimestamps == true
+            && packetTimestampToleranceUs != nil && audioVideoEndDifferenceUs != nil
+            && (strategy != .streamCopyV1 || core003ScopeVerified == true)
+    }
 }
 struct JobResult: Codable, Sendable {
     let mockOnly: Bool
@@ -68,18 +155,92 @@ struct JobResult: Codable, Sendable {
     let actualSourceRangeUs: MediaRange?
     let outputMediaInfo: MediaInfo?
     let validation: OutputValidation?
+    let strategy: String?
+    let profile: String?
+    let reencoded: Bool?
+    let lossless: Bool?
+    let accuratePlan: AccuratePlan?
+    var exportStrategy: ExportStrategy? {
+        guard fileCreated else { return nil }
+        if strategy == nil && profile == nil { return .legacyStreamCopy }
+        if strategy == "stream_copy", profile == "mp4_h264_copy_v1" { return .streamCopyV1 }
+        if strategy == "accurate_reencode", profile == "mp4_h264_standard_v1" { return .accurateReencode }
+        return nil
+    }
+    enum CodingKeys: String, CodingKey {
+        case mockOnly, fileCreated, mediaInfo, requestedRangeUs, actualRangeUs, actualSourceRangeUs
+        case outputMediaInfo, validation, strategy, profile, reencoded, lossless, accuratePlan
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mockOnly = try c.decode(Bool.self, forKey: .mockOnly)
+        fileCreated = try c.decode(Bool.self, forKey: .fileCreated)
+        mediaInfo = try c.decodeIfPresent(MediaInfo.self, forKey: .mediaInfo)
+        requestedRangeUs = try c.decodeIfPresent(MediaRange.self, forKey: .requestedRangeUs)
+        actualRangeUs = try c.decodeIfPresent(MediaRange.self, forKey: .actualRangeUs)
+        actualSourceRangeUs = try c.decodeIfPresent(MediaRange.self, forKey: .actualSourceRangeUs)
+        outputMediaInfo = try c.decodeIfPresent(MediaInfo.self, forKey: .outputMediaInfo)
+        validation = try c.decodeIfPresent(OutputValidation.self, forKey: .validation)
+        strategy = try c.decodeIfPresent(String.self, forKey: .strategy)
+        profile = try c.decodeIfPresent(String.self, forKey: .profile)
+        reencoded = try c.decodeIfPresent(Bool.self, forKey: .reencoded)
+        lossless = try c.decodeIfPresent(Bool.self, forKey: .lossless)
+        accuratePlan = try c.decodeIfPresent(AccuratePlan.self, forKey: .accuratePlan)
+        if fileCreated {
+            guard !mockOnly, requestedRangeUs != nil, actualRangeUs != nil,
+                  actualSourceRangeUs != nil, outputMediaInfo != nil,
+                  let mode = exportStrategy, validation?.hasRequiredEvidence(for: mode) == true,
+                  (mode == .legacyStreamCopy || (reencoded == mode.isReencoded && lossless == !mode.isReencoded)),
+                  (mode != .accurateReencode || accuratePlan != nil) else {
+                throw DecodingError.dataCorruptedError(forKey: .validation, in: c,
+                    debugDescription: "Core output lacks the declared strategy's required validation evidence.")
+            }
+        }
+    }
 }
 struct BackendConfiguration: Codable, Equatable, Sendable {
     let ffmpeg: String
     let ffprobe: String
     let timeoutMs: UInt64
     let maxOutputBytes: UInt64
-    static func hostDefault() -> Self {
+    let core003Enabled: Bool
+    let accurateReencodeTimeoutMs: UInt64
+    init(ffmpeg: String, ffprobe: String, timeoutMs: UInt64, maxOutputBytes: UInt64,
+         core003Enabled: Bool = false, accurateReencodeTimeoutMs: UInt64 = 600000) {
+        self.ffmpeg = ffmpeg; self.ffprobe = ffprobe; self.timeoutMs = timeoutMs
+        self.maxOutputBytes = maxOutputBytes; self.core003Enabled = core003Enabled
+        self.accurateReencodeTimeoutMs = accurateReencodeTimeoutMs
+    }
+    enum CodingKeys: String, CodingKey {
+        case ffmpeg, ffprobe, timeoutMs, maxOutputBytes, core003Enabled, accurateReencodeTimeoutMs
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ffmpeg = try c.decode(String.self, forKey: .ffmpeg); ffprobe = try c.decode(String.self, forKey: .ffprobe)
+        timeoutMs = try c.decode(UInt64.self, forKey: .timeoutMs)
+        maxOutputBytes = try c.decode(UInt64.self, forKey: .maxOutputBytes)
+        core003Enabled = try c.decodeIfPresent(Bool.self, forKey: .core003Enabled) ?? false
+        accurateReencodeTimeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .accurateReencodeTimeoutMs) ?? 600000
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(ffmpeg, forKey: .ffmpeg); try c.encode(ffprobe, forKey: .ffprobe)
+        try c.encode(timeoutMs, forKey: .timeoutMs); try c.encode(maxOutputBytes, forKey: .maxOutputBytes)
+        // Keep legacy configurations byte-shape compatible with older Core.
+        if core003Enabled {
+            try c.encode(true, forKey: .core003Enabled)
+            try c.encode(accurateReencodeTimeoutMs, forKey: .accurateReencodeTimeoutMs)
+        }
+    }
+    static func hostDefault(core003Enabled: Bool = false) -> Self {
         let environment = ProcessInfo.processInfo.environment
         return Self(ffmpeg: environment["MEDIASTUDIO_FFMPEG"] ?? "/opt/homebrew/bin/ffmpeg",
                     ffprobe: environment["MEDIASTUDIO_FFPROBE"] ?? "/opt/homebrew/bin/ffprobe",
                     timeoutMs: UInt64(environment["MEDIASTUDIO_TIMEOUT_MS"] ?? "30000") ?? 0,
-                    maxOutputBytes: UInt64(environment["MEDIASTUDIO_MAX_OUTPUT_BYTES"] ?? "8388608") ?? 0)
+                    maxOutputBytes: UInt64(environment["MEDIASTUDIO_MAX_OUTPUT_BYTES"] ?? "8388608") ?? 0,
+                    core003Enabled: core003Enabled,
+                    accurateReencodeTimeoutMs: core003Enabled
+                        ? UInt64(environment["MEDIASTUDIO_ACCURATE_TIMEOUT_MS"] ?? "600000") ?? 0 : 600000)
     }
 }
 private struct EngineConfiguration: Encodable {
@@ -99,7 +260,8 @@ private struct TrimRequest: Encodable {
     let source: MediaLocation
     let destination: MediaLocation
     let range: MediaRange
-    let strategy = "stream_copy"
+    let strategy: String
+    let profile: String?
     let streamSelection = "all_supported"
     let allowReencodeFallback = false
 }
@@ -235,15 +397,21 @@ actor CoreBridge {
     private var backend: BackendConfiguration?
     private var closing = false
     private var closeSnapshots: [JobSnapshot] = []
+    private var cleanupUnconfirmed = false
     func connect(backend requested: BackendConfiguration? = nil) throws -> CoreConnection {
         guard !closing else { throw BridgeError(code: -7, operation: "closing") }
-        if owner == nil { owner = try EngineOwner(backend: requested); backend = requested }
+        guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
+        if owner == nil {
+            closeSnapshots.removeAll(keepingCapacity: true)
+            owner = try EngineOwner(backend: requested); backend = requested
+        }
         guard requested == backend else { throw BridgeError(code: -7, operation: "configuration_requires_close") }
         guard let owner else { throw BridgeError(code: -100, operation: "connect") }
         return try CoreConnection(version: owner.version(), capabilities: owner.capabilities())
     }
     func submit(outcome: MockOutcome) throws -> JobSnapshot {
         guard !closing else { throw BridgeError(code: -7, operation: "closing") }
+        guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
         let request = Data("{\"schema_version\":0,\"operation\":\"mock\",\"outcome\":\"\(outcome.rawValue)\"}".utf8)
         return try owner.submit(request)
@@ -251,18 +419,22 @@ actor CoreBridge {
     func submitProbe(source: URL) throws -> JobSnapshot {
         try submitRawForSelfTest(requestData(ProbeRequest(source: MediaLocation(uri: source.absoluteString))))
     }
-    func submitTrim(source: URL, destination: URL, range: MediaRange) throws -> JobSnapshot {
+    func submitTrim(source: URL, destination: URL, range: MediaRange, strategy: ExportStrategy = .legacyStreamCopy) throws -> JobSnapshot {
         try submitRawForSelfTest(requestData(TrimRequest(source: MediaLocation(uri: source.absoluteString),
-                                                       destination: MediaLocation(uri: destination.absoluteString), range: range)))
+                                                       destination: MediaLocation(uri: destination.absoluteString), range: range,
+                                                       strategy: strategy.wireStrategy, profile: strategy.profile)))
     }
     func submitRawForSelfTest(_ data: Data) throws -> JobSnapshot {
         guard !closing else { throw BridgeError(code: -7, operation: "closing") }
+        guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
         return try owner.submit(data)
     }
     func poll(id: String) throws -> JobSnapshot {
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
-        return try owner.poll(id)
+        let value = try owner.poll(id)
+        if value.error?.code == "CLEANUP_FAILED" { cleanupUnconfirmed = true }
+        return value
     }
     func cancel(id: String) throws {
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
@@ -270,20 +442,25 @@ actor CoreBridge {
     }
     func close() async throws {
         guard !closing else { throw BridgeError(code: -7, operation: "closing") }
+        guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
         guard let owner else { return }
         closing = true
         defer { closing = false }
         do {
             for id in owner.jobIDs { try owner.cancel(id) }
-            let deadline = ContinuousClock.now + .milliseconds(Int64(backend?.timeoutMs ?? 30000) + 5000)
+            // Cancellation is a separate bounded drain, not the media encode deadline.
+            // Do not wait 600s merely because accurate processing permits that long.
+            let deadline = ContinuousClock.now + .seconds(15)
             while true {
                 var active = false
                 for id in owner.jobIDs {
                     let snapshot = try owner.poll(id)
                     active = active || !["succeeded", "failed", "cancelled"].contains(snapshot.state)
+                    if snapshot.error?.code == "CLEANUP_FAILED" { cleanupUnconfirmed = true }
                     if ["succeeded", "failed", "cancelled"].contains(snapshot.state) {
                         closeSnapshots.removeAll { $0.jobId == snapshot.jobId }
                         closeSnapshots.append(snapshot)
+                        if closeSnapshots.count > 256 { closeSnapshots.removeFirst(closeSnapshots.count - 256) }
                     }
                 }
                 if !active { break }
@@ -296,12 +473,14 @@ actor CoreBridge {
             // A quarantined engine rejects cancel/poll but explicitly permits
             // destroy, whose Rust Drop cancels and joins its worker. A healthy
             // busy engine returns BUSY and remains owned for retry.
+            guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
             do { try owner.destroy() }
             catch { throw error }
             lastDiagnostics.accumulate(owner.diagnostics)
             self.owner = nil; backend = nil
             return
         }
+        guard !cleanupUnconfirmed else { throw BridgeError(code: -100, operation: "cleanup_unconfirmed") }
         try owner.destroy()
         lastDiagnostics.accumulate(owner.diagnostics)
         self.owner = nil
