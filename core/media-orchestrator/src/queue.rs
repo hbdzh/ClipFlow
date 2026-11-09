@@ -3,7 +3,8 @@
 use super::{JobState, heavy};
 use media_domain::{
     ACCURATE_REENCODE_PROFILE, AudioSelection, BackendConfig, CoreError, MediaError, MediaRequest,
-    QueueCommand, Request, STREAM_COPY_V1_PROFILE, TrimStrategy, parse_request, validate_job_id,
+    QueueCommand, Request, STREAM_COPY_V1_PROFILE, TrimStrategy, parse_request_with_ai,
+    validate_job_id,
 };
 use media_ffmpeg::PreparedMedia;
 use serde_json::{Value, json};
@@ -14,11 +15,45 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 const CAPACITY: usize = 32;
 const HISTORY: usize = 100;
+// Serializes Core-004 and development AI admission across engines so their
+// independent storage ledgers cannot both reserve based on stale snapshots.
+static ADMISSION_GATE: Mutex<()> = Mutex::new(());
+
+fn admission() -> Result<std::sync::MutexGuard<'static, ()>, CoreError> {
+    ADMISSION_GATE.lock().map_err(|_| {
+        heavy::quarantine();
+        CoreError::Internal
+    })
+}
+
+#[derive(Clone)]
+enum QueueItem {
+    Media(MediaRequest),
+    #[cfg(target_os = "macos")]
+    Ai,
+}
+
+impl QueueItem {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Media(request) => request.operation(),
+            #[cfg(target_os = "macos")]
+            Self::Ai => "ai_separate",
+        }
+    }
+}
+
+#[derive(Clone)]
+enum QueuePlan {
+    Media(Arc<PreparedMedia>),
+    #[cfg(target_os = "macos")]
+    Ai(Arc<super::ai::AiPlan>),
+}
 
 struct QueueJob {
-    request: MediaRequest,
+    request: QueueItem,
     destination_identity: Option<std::path::PathBuf>,
-    prepared: Option<Arc<PreparedMedia>>,
+    prepared: Option<QueuePlan>,
     cancel: Arc<AtomicBool>,
     state: JobState,
     result: Option<Value>,
@@ -222,8 +257,56 @@ impl QueueEngine {
         bounded(self.submit_inner(input)?)
     }
     fn submit_inner(&mut self, input: &[u8]) -> Result<Value, CoreError> {
-        match parse_request(input)? {
+        match parse_request_with_ai(input, self.config.ai_backend.is_some())? {
             Request::Mock(_) => Err(CoreError::UnsupportedOperation),
+            // Configuration/validation are present but the AI backend has not
+            // yet passed integration. Never fabricate a queued job.
+            Request::AiSeparate {
+                source,
+                destination,
+            } => {
+                #[cfg(target_os = "macos")]
+                if self
+                    .config
+                    .ai_backend
+                    .as_ref()
+                    .and_then(|x| x.development_root.as_ref())
+                    .is_some()
+                {
+                    return self.accept_ai(source, destination);
+                }
+                // Read-only rejection checks are safe to expose while the
+                // actual backend remains unavailable. They never create a job
+                // or establish that the path will remain unchanged later.
+                match std::fs::symlink_metadata(&source) {
+                    Ok(m) if m.is_file() && !m.file_type().is_symlink() && m.len() > 0 => (),
+                    _ => {
+                        return Ok(rejected(
+                            "ai_separate",
+                            0,
+                            "INVALID_INPUT",
+                            "The source is not an available regular file.",
+                        ));
+                    }
+                }
+                match std::fs::symlink_metadata(&destination) {
+                    Ok(_) => Ok(rejected(
+                        "ai_separate",
+                        0,
+                        "OUTPUT_EXISTS",
+                        "The destination already exists.",
+                    )),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(CoreError::UnsupportedOperation)
+                    }
+                    Err(_) => Ok(rejected(
+                        "ai_separate",
+                        0,
+                        "PERMISSION_DENIED",
+                        "The destination cannot be inspected.",
+                    )),
+                }
+            }
             Request::Media(request) => self.accept(vec![request], None, "submit"),
             Request::Queue(QueueCommand::Snapshot) => Ok(self
                 .shared
@@ -302,7 +385,18 @@ impl QueueEngine {
                             "Only failed or cancelled jobs can be retried.",
                         ));
                     }
-                    let mut request = job.request.clone();
+                    let mut request = match job.request.clone() {
+                        QueueItem::Media(request) => request,
+                        #[cfg(target_os = "macos")]
+                        QueueItem::Ai => {
+                            return Ok(rejected(
+                                "job_retry",
+                                0,
+                                "INVALID_INPUT",
+                                "AI retries are not supported in this development subset.",
+                            ));
+                        }
+                    };
                     match &mut request {
                         MediaRequest::Trim { destination, .. }
                         | MediaRequest::Transcode { destination, .. } => {
@@ -331,6 +425,78 @@ impl QueueEngine {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    fn accept_ai(
+        &mut self,
+        source: std::path::PathBuf,
+        destination: std::path::PathBuf,
+    ) -> Result<Value, CoreError> {
+        let _admission = admission()?;
+        {
+            let state = self.shared.0.lock().map_err(|_| CoreError::Internal)?;
+            if state.shutdown || state.cleanup_failed || heavy::quarantined() {
+                return Ok(rejected(
+                    "ai_separate",
+                    0,
+                    "CLEANUP_FAILED",
+                    "The engine cannot safely accept new work.",
+                ));
+            }
+            if state.active_count() >= CAPACITY {
+                return Ok(rejected(
+                    "ai_separate",
+                    0,
+                    "RESOURCE_LIMIT",
+                    "The queue is full.",
+                ));
+            }
+        }
+        let plan = match super::ai::AiPlan::prepare(&self.config, &source, &destination) {
+            Ok(plan) => Arc::new(plan),
+            Err(error) => return Ok(rejected("ai_separate", 0, error.code, &error.message)),
+        };
+        let mut state = self.shared.0.lock().map_err(|_| CoreError::Internal)?;
+        if state.shutdown || state.cleanup_failed || heavy::quarantined() {
+            return Ok(rejected(
+                "ai_separate",
+                0,
+                "CLEANUP_FAILED",
+                "Cleanup is unconfirmed.",
+            ));
+        }
+        if state.active_count() >= CAPACITY {
+            return Ok(rejected(
+                "ai_separate",
+                0,
+                "RESOURCE_LIMIT",
+                "The queue is full.",
+            ));
+        }
+        let sequence = state.next;
+        state.next = state.next.checked_add(1).ok_or(CoreError::LimitExceeded)?;
+        let id = format!("media-{sequence}");
+        let mut summary = plan.summary();
+        if let Some(object) = summary.as_object_mut() {
+            object.insert("operation".into(), json!("ai_separate"));
+        }
+        let job = QueueJob {
+            request: QueueItem::Ai,
+            destination_identity: None,
+            prepared: Some(QueuePlan::Ai(plan)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            state: JobState::Queued,
+            result: None,
+            error: None,
+            summary,
+            sequence,
+        };
+        let response = job.snapshot(&id);
+        state.jobs.insert(id.clone(), job);
+        state.pending.push_back(id);
+        self.shared.1.notify_one();
+        Ok(response)
+    }
+
     fn replay(&self, command: &QueueCommand, operation: &str) -> Result<Option<Value>, CoreError> {
         let key = match command {
             QueueCommand::BatchSubmit { submission_id, .. }
@@ -346,6 +512,16 @@ impl QueueEngine {
         command: Option<QueueCommand>,
         operation: &str,
     ) -> Result<Value, CoreError> {
+        let _admission = admission()?;
+        #[cfg(target_os = "macos")]
+        if super::ai::any_reserved() {
+            return Ok(rejected(
+                operation,
+                0,
+                "RESOURCE_LIMIT",
+                "A development AI reservation is active.",
+            ));
+        }
         if let Some(command) = &command
             && let Some(value) = self.replay(command, operation)?
         {
@@ -468,8 +644,8 @@ impl QueueEngine {
                 QueueJob {
                     destination_identity: destination(&request)
                         .map(|_| plan.destination_identity().to_owned()),
-                    request,
-                    prepared: Some(plan),
+                    request: QueueItem::Media(request),
+                    prepared: Some(QueuePlan::Media(plan)),
                     cancel: Arc::new(AtomicBool::new(false)),
                     state: JobState::Queued,
                     result: None,
@@ -579,10 +755,9 @@ fn run_worker(shared: Shared, config: BackendConfig) {
             let Some(first) = state.pending.front() else {
                 continue;
             };
-            let heavy_request = state
-                .jobs
-                .get(first)
-                .is_some_and(|j| !matches!(j.request, MediaRequest::Probe { .. }));
+            let heavy_request = state.jobs.get(first).is_some_and(|j| {
+                !matches!(j.request, QueueItem::Media(MediaRequest::Probe { .. }))
+            });
             let permit = if heavy_request {
                 match heavy::try_acquire() {
                     Ok(Some(p)) => Some(p),
@@ -631,19 +806,33 @@ fn run_worker(shared: Shared, config: BackendConfig) {
             state.running = Some(id.clone());
             (id, request, prepared, cancel, permit)
         };
-        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            media_ffmpeg::execute_prepared(&config, &prepared, &cancel)
-        })) {
-            Ok(v) => v,
-            Err(payload) => {
-                std::mem::forget(payload);
-                prepared.mark_quarantined();
-                Err(MediaError::new(
-                    "CLEANUP_FAILED",
-                    "The worker unwound without confirmed media cleanup.",
-                ))
-            }
-        };
+        #[cfg(target_os = "macos")]
+        if let QueuePlan::Ai(plan) = &prepared {
+            run_ai_job(&shared, &id, plan, &cancel, &mut permit);
+            drop(prepared);
+            drop(permit);
+            continue;
+        }
+        let outcome =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &prepared {
+                QueuePlan::Media(plan) => media_ffmpeg::execute_prepared(&config, plan, &cancel),
+                #[cfg(target_os = "macos")]
+                QueuePlan::Ai(_) => unreachable!("handled above"),
+            })) {
+                Ok(v) => v,
+                Err(payload) => {
+                    std::mem::forget(payload);
+                    match &prepared {
+                        QueuePlan::Media(plan) => plan.mark_quarantined(),
+                        #[cfg(target_os = "macos")]
+                        QueuePlan::Ai(plan) => plan.mark_quarantined(),
+                    }
+                    Err(MediaError::new(
+                        "CLEANUP_FAILED",
+                        "The worker unwound without confirmed media cleanup.",
+                    ))
+                }
+            };
         let _ = request;
         if outcome
             .as_ref()
@@ -687,6 +876,124 @@ fn run_worker(shared: Shared, config: BackendConfig) {
         }
         drop(prepared);
         drop(permit);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_ai(plan: &super::ai::AiPlan, permit: &mut Option<heavy::Permit>) {
+    plan.mark_quarantined();
+    heavy::quarantine();
+    if let Some(permit) = permit {
+        permit.quarantine();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_ai_job(
+    shared: &Shared,
+    id: &str,
+    plan: &Arc<super::ai::AiPlan>,
+    cancel: &AtomicBool,
+    permit: &mut Option<heavy::Permit>,
+) {
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plan.run(cancel)));
+    let outcome: Result<Value, MediaError> = match run {
+        Ok(Ok(mut ready)) => {
+            // This lock is the cancellation/commit linearization boundary.
+            // No worker wait, decoding or long validation occurs while held.
+            let Ok(mut state) = shared.0.lock() else {
+                quarantine_ai(plan, permit);
+                drop(ready); // its transaction owner quarantines, never deletes blindly
+                return;
+            };
+            if cancel.load(Ordering::Acquire) {
+                drop(state);
+                match ready.cleanup() {
+                    Ok(()) => Err(MediaError::new("CANCELLED", "AI operation was cancelled.")),
+                    Err(error) => Err(error),
+                }
+            } else {
+                let commit =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ready.commit()));
+                match commit {
+                    Ok(Ok((result, cleanup_unconfirmed))) => {
+                        if cleanup_unconfirmed {
+                            quarantine_ai(plan, permit);
+                            state.cleanup_failed = true;
+                        }
+                        if let Some(job) = state.jobs.get_mut(id) {
+                            job.state = JobState::Succeeded;
+                            job.result = Some(result);
+                            job.prepared = None;
+                        }
+                        state.running = None;
+                        state.terminal(id);
+                        state.prune_submissions();
+                        shared.1.notify_all();
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        drop(state);
+                        match ready.cleanup() {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(cleanup),
+                        }
+                    }
+                    Err(payload) => {
+                        std::mem::forget(payload);
+                        drop(state);
+                        quarantine_ai(plan, permit);
+                        drop(ready);
+                        Err(MediaError::new(
+                            "CLEANUP_FAILED",
+                            "AI commit did not finish safely.",
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(Err(error)) => Err(error),
+        Err(payload) => {
+            std::mem::forget(payload);
+            quarantine_ai(plan, permit);
+            Err(MediaError::new(
+                "CLEANUP_FAILED",
+                "AI execution unwound without confirmed cleanup.",
+            ))
+        }
+    };
+    if outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.code == "CLEANUP_FAILED")
+    {
+        quarantine_ai(plan, permit);
+    }
+    if let Ok(mut state) = shared.0.lock() {
+        if outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.code == "CLEANUP_FAILED")
+        {
+            state.cleanup_failed = true;
+        }
+        if let Some(job) = state.jobs.get_mut(id) {
+            if let Err(error) = outcome {
+                job.state = if error.code == "CANCELLED" {
+                    JobState::Cancelled
+                } else {
+                    JobState::Failed
+                };
+                job.error = Some(error);
+            }
+            job.prepared = None;
+        }
+        state.running = None;
+        state.terminal(id);
+        state.prune_submissions();
+        shared.1.notify_all();
+    } else {
+        quarantine_ai(plan, permit);
     }
 }
 impl Drop for QueueEngine {

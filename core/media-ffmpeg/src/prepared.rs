@@ -625,6 +625,7 @@ mod tests {
             core003_enabled: true,
             core004_enabled: true,
             max_output_bytes: 1024,
+            ai_backend: None,
         };
         let source = PathBuf::from("/input.mp4");
         let destination = PathBuf::from("/output.mp4");

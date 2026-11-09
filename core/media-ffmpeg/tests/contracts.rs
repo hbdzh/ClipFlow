@@ -12,6 +12,7 @@ fn missing_backend() -> BackendConfig {
         core004_enabled: false,
         transcode_timeout_ms: 600000,
         max_output_bytes: 1024,
+        ai_backend: None,
     }
 }
 

@@ -8,4 +8,5 @@ publish.workspace = true
 [dependencies]
 media-domain.workspace = true
 media-ffmpeg.workspace = true
+media-ai.workspace = true
 serde_json.workspace = true
