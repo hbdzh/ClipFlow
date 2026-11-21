@@ -1,0 +1,48 @@
+# Build products / native libraries
+**/target/
+**/bin/
+**/obj/
+**/.build/
+**/DerivedData/
+**/build/
+**/.gradle/
+**/__pycache__/
+*.py[cod]
+*.dll
+*.dylib
+*.so
+*.pdb
+*.dSYM/
+
+# Signing and secrets
+*.p12
+*.pfx
+*.mobileprovision
+*.keystore
+*.jks
+*.env
+.env*
+!*.env.example
+
+# App-generated assets / copyrighted media
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.flac
+*.onnx
+*.pth
+*.pt
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local task worktrees (created only when a task starts)
+/.worktrees/
+
+# Local QA captures and generated reports
+/docs/qa-002/evidence/
