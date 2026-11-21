@@ -300,6 +300,8 @@ mod tests {
             accurate_reencode_timeout_ms: timeout_ms,
             core003_enabled: false,
             core004_enabled: false,
+            video_transform_enabled: false,
+            mix_stems_enabled: false,
             transcode_timeout_ms: 600000,
             max_output_bytes,
             ai_backend: None,

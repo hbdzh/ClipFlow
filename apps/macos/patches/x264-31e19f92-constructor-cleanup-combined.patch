@@ -1,0 +1,319 @@
+--- a/common/frame.c
++++ b/common/frame.c
+@@ -852,17 +852,31 @@
+ 
+ int x264_sync_frame_list_init( x264_sync_frame_list_t *slist, int max_size )
+ {
++    int mutex_initialized = 0;
++    int fill_initialized = 0;
++
+     if( max_size < 0 )
+         return -1;
+     slist->i_max_size = max_size;
+     slist->i_size = 0;
+     CHECKED_MALLOCZERO( slist->list, (max_size+1) * sizeof(x264_frame_t*) );
+-    if( x264_pthread_mutex_init( &slist->mutex, NULL ) ||
+-        x264_pthread_cond_init( &slist->cv_fill, NULL ) ||
+-        x264_pthread_cond_init( &slist->cv_empty, NULL ) )
+-        return -1;
++    if( x264_pthread_mutex_init( &slist->mutex, NULL ) )
++        goto fail;
++    mutex_initialized = 1;
++    if( x264_pthread_cond_init( &slist->cv_fill, NULL ) )
++        goto fail;
++    fill_initialized = 1;
++    if( x264_pthread_cond_init( &slist->cv_empty, NULL ) )
++        goto fail;
+     return 0;
+ fail:
++    if( fill_initialized )
++        x264_pthread_cond_destroy( &slist->cv_fill );
++    if( mutex_initialized )
++        x264_pthread_mutex_destroy( &slist->mutex );
++    x264_free( slist->list );
++    slist->list = NULL;
++    slist->i_max_size = slist->i_size = 0;
+     return -1;
+ }
+ 
+--- a/common/threadpool.c
++++ b/common/threadpool.c
+@@ -67,26 +67,31 @@
+     return NULL;
+ }
+ 
++static void threadpool_list_delete( x264_sync_frame_list_t *slist );
++
+ int x264_threadpool_init( x264_threadpool_t **p_pool, int threads )
+ {
++    x264_threadpool_t *pool = NULL;
++    int lists_initialized = 0;
++    int threads_created = 0;
++
+     if( threads <= 0 )
+         return -1;
+-
+     if( x264_threading_init() < 0 )
+         return -1;
+ 
+-    x264_threadpool_t *pool;
+     CHECKED_MALLOCZERO( pool, sizeof(x264_threadpool_t) );
+-    *p_pool = pool;
+-
+-    pool->threads   = threads;
+-
++    pool->threads = threads;
+     CHECKED_MALLOC( pool->thread_handle, pool->threads * sizeof(x264_pthread_t) );
+-
+-    if( x264_sync_frame_list_init( &pool->uninit, pool->threads ) ||
+-        x264_sync_frame_list_init( &pool->run, pool->threads ) ||
+-        x264_sync_frame_list_init( &pool->done, pool->threads ) )
++    if( x264_sync_frame_list_init( &pool->uninit, pool->threads ) )
+         goto fail;
++    lists_initialized = 1;
++    if( x264_sync_frame_list_init( &pool->run, pool->threads ) )
++        goto fail;
++    lists_initialized = 2;
++    if( x264_sync_frame_list_init( &pool->done, pool->threads ) )
++        goto fail;
++    lists_initialized = 3;
+ 
+     for( int i = 0; i < pool->threads; i++ )
+     {
+@@ -95,11 +100,36 @@
+        x264_sync_frame_list_push( &pool->uninit, (void*)job );
+     }
+     for( int i = 0; i < pool->threads; i++ )
++    {
+         if( x264_pthread_create( pool->thread_handle+i, NULL, (void*)threadpool_thread, pool ) )
+             goto fail;
++        threads_created++;
++    }
+ 
++    /* No caller can queue jobs before a complete pool is committed. */
++    *p_pool = pool;
+     return 0;
+ fail:
++    if( pool )
++    {
++        if( threads_created )
++        {
++            x264_pthread_mutex_lock( &pool->run.mutex );
++            pool->exit = 1;
++            x264_pthread_cond_broadcast( &pool->run.cv_fill );
++            x264_pthread_mutex_unlock( &pool->run.mutex );
++            for( int i = 0; i < threads_created; i++ )
++                x264_pthread_join( pool->thread_handle[i], NULL );
++        }
++        if( lists_initialized >= 3 )
++            threadpool_list_delete( &pool->done );
++        if( lists_initialized >= 2 )
++            threadpool_list_delete( &pool->run );
++        if( lists_initialized >= 1 )
++            threadpool_list_delete( &pool->uninit );
++        x264_free( pool->thread_handle );
++        x264_free( pool );
++    }
+     return -1;
+ }
+ 
+--- a/encoder/lookahead.c
++++ b/encoder/lookahead.c
+@@ -131,40 +131,74 @@
+ 
+ int x264_lookahead_init( x264_t *h, int i_slicetype_length )
+ {
+-    x264_lookahead_t *look;
++    x264_lookahead_t *look = NULL;
++    x264_t *look_h = NULL;
++    int lists_initialized = 0;
++    int cache_started = 0;
++    int thread_buffers_started = 0;
++
+     CHECKED_MALLOCZERO( look, sizeof(x264_lookahead_t) );
+-    for( int i = 0; i < h->param.i_threads; i++ )
+-        h->thread[i]->lookahead = look;
+-
+     look->i_last_keyframe = - h->param.i_keyint_max;
+     look->b_analyse_keyframe = (h->param.rc.b_mb_tree || (h->param.rc.i_vbv_buffer_size && h->param.rc.i_lookahead))
+                                && !h->param.rc.b_stat_read;
+     look->i_slicetype_length = i_slicetype_length;
+ 
+-    /* init frame lists */
+-    if( x264_sync_frame_list_init( &look->ifbuf, h->param.i_sync_lookahead+3 ) ||
+-        x264_sync_frame_list_init( &look->next, h->frames.i_delay+3 ) ||
+-        x264_sync_frame_list_init( &look->ofbuf, h->frames.i_delay+3 ) )
++    if( x264_sync_frame_list_init( &look->ifbuf, h->param.i_sync_lookahead+3 ) )
+         goto fail;
+-
+-    if( !h->param.i_sync_lookahead )
+-        return 0;
+-
+-    x264_t *look_h = h->thread[h->param.i_threads];
+-    *look_h = *h;
+-    if( x264_macroblock_cache_allocate( look_h ) )
++    lists_initialized = 1;
++    if( x264_sync_frame_list_init( &look->next, h->frames.i_delay+3 ) )
+         goto fail;
+-
+-    if( x264_macroblock_thread_allocate( look_h, 1 ) < 0 )
++    lists_initialized = 2;
++    if( x264_sync_frame_list_init( &look->ofbuf, h->frames.i_delay+3 ) )
+         goto fail;
+-
+-    if( x264_pthread_create( &look->thread_handle, NULL, (void*)lookahead_thread, look_h ) )
+-        goto fail;
+-    look->b_thread_active = 1;
+-
++    lists_initialized = 3;
++
++    if( h->param.i_sync_lookahead )
++    {
++        look_h = h->thread[h->param.i_threads];
++        *look_h = *h;
++        look_h->lookahead = look;
++        /* Newly allocated lookahead buffers must not inherit borrowed owners. */
++        look_h->mb.base = NULL;
++        look_h->scratch_buffer = NULL;
++        look_h->scratch_buffer2 = NULL;
++        cache_started = 1;
++        if( x264_macroblock_cache_allocate( look_h ) )
++            goto fail;
++        thread_buffers_started = 1;
++        if( x264_macroblock_thread_allocate( look_h, 1 ) < 0 )
++            goto fail;
++        /* Last fallible operation. The private worker waits on its initialized
++         * empty queues until encoder_open can return and publish frames. */
++        if( x264_pthread_create( &look->thread_handle, NULL, (void*)lookahead_thread, look_h ) )
++            goto fail;
++        look->b_thread_active = 1;
++    }
++
++    for( int i = 0; i < h->param.i_threads; i++ )
++        h->thread[i]->lookahead = look;
+     return 0;
+ fail:
+-    x264_free( look );
++    if( look_h )
++    {
++        if( thread_buffers_started )
++            x264_macroblock_thread_free( look_h, 1 );
++        if( cache_started )
++            x264_macroblock_cache_free( look_h );
++        /* The extra context was allocated by encoder_open and remains its
++         * caller's allocation. Remove private/borrowed aliases on rollback. */
++        memset( look_h, 0, sizeof(*look_h) );
++    }
++    if( look )
++    {
++        if( lists_initialized >= 3 )
++            x264_sync_frame_list_delete( &look->ofbuf );
++        if( lists_initialized >= 2 )
++            x264_sync_frame_list_delete( &look->next );
++        if( lists_initialized >= 1 )
++            x264_sync_frame_list_delete( &look->ifbuf );
++        x264_free( look );
++    }
+     return -1;
+ }
+ 
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1509,6 +1509,11 @@
+     x264_t *h;
+     char buf[1000], *p;
+     int i_slicetype_length;
++    int cqm_initialized = 0;
++    int costs_started = 0;
++    int shared_contexts_started = 0;
++    int threadpool_initialized = 0;
++    int lookaheadpool_initialized = 0;
+ 
+     CHECKED_MALLOCZERO( h, sizeof(x264_t) );
+ 
+@@ -1586,6 +1591,7 @@
+ 
+     if( x264_cqm_init( h ) < 0 )
+         goto fail;
++    cqm_initialized = 1;
+ 
+     h->mb.i_mb_width = h->sps->i_mb_width;
+     h->mb.i_mb_height = h->sps->i_mb_height;
+@@ -1705,6 +1711,7 @@
+         p += sprintf( p, " none!" );
+     x264_log( h, X264_LOG_INFO, "%s\n", buf );
+ 
++    costs_started = 1;
+     if( x264_analyse_init_costs( h ) )
+         goto fail;
+ 
+@@ -1734,12 +1741,22 @@
+ 
+     CHECKED_MALLOC( h->reconfig_h, sizeof(x264_t) );
+ 
+-    if( h->param.i_threads > 1 &&
+-        x264_threadpool_init( &h->threadpool, h->param.i_threads ) )
+-        goto fail;
+-    if( h->param.i_lookahead_threads > 1 &&
+-        x264_threadpool_init( &h->lookaheadpool, h->param.i_lookahead_threads ) )
+-        goto fail;
++    if( h->param.i_threads > 1 )
++    {
++        if( x264_threadpool_init( &h->threadpool, h->param.i_threads ) )
++            goto fail;
++        threadpool_initialized = 1;
++    }
++    if( h->param.i_lookahead_threads > 1 )
++    {
++        if( x264_threadpool_init( &h->lookaheadpool, h->param.i_lookahead_threads ) )
++            goto fail;
++        lookaheadpool_initialized = 1;
++    }
++
++    /* Idle pools have not received jobs referring to h. Later initialization
++     * can introduce shared contexts and platform-owned resources. */
++    shared_contexts_started = 1;
+ 
+ #if HAVE_OPENCL
+     if( h->param.b_opencl )
+@@ -1855,7 +1872,29 @@
+     return h;
+ fail:
+     if( h != NULL )
++    {
++        /* Only the exclusive prefix and fully initialized idle pools are
++         * safe here. Shared contexts need separate staged teardown. */
++        if( !shared_contexts_started )
++        {
++            if( lookaheadpool_initialized )
++                x264_threadpool_delete( h->lookaheadpool );
++            if( threadpool_initialized )
++                x264_threadpool_delete( h->threadpool );
++            if( costs_started )
++                x264_analyse_free_costs( h );
++            x264_free( h->cost_table );
++            x264_free( h->frames.unused[0] );
++            x264_free( h->frames.unused[1] );
++            x264_free( h->frames.current );
++            x264_free( h->frames.blank_unused );
++            x264_free( h->nal_buffer );
++            x264_free( h->reconfig_h );
++            if( cqm_initialized )
++                x264_cqm_delete( h );
++        }
+         x264_param_cleanup( &h->param );
++    }
+     x264_free( h );
+     return NULL;
+ }
+--- a/common/set.c
++++ b/common/set.c
+@@ -265,7 +265,7 @@
+         if( h->param.rc.i_qp_min > h->param.rc.i_qp_max )
+         {
+             x264_log( h, X264_LOG_ERROR, "Impossible QP constraints for CQM (min=%d, max=%d)\n", h->param.rc.i_qp_min, h->param.rc.i_qp_max );
+-            return -1;
++            goto fail;
+         }
+     }
+     return 0;

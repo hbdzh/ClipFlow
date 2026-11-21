@@ -62,6 +62,8 @@ pub struct BackendConfig {
     pub accurate_reencode_timeout_ms: u64,
     pub core003_enabled: bool,
     pub core004_enabled: bool,
+    pub video_transform_enabled: bool,
+    pub mix_stems_enabled: bool,
     pub transcode_timeout_ms: u64,
     pub max_output_bytes: usize,
     pub ai_backend: Option<AiBackendConfig>,
@@ -69,12 +71,24 @@ pub struct BackendConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AiBackendConfig {
-    pub python: PathBuf,
-    pub worker: PathBuf,
+    pub worker: AiWorker,
     pub model: PathBuf,
     pub timeout_ms: u64,
     /// Explicit trusted local-only workspace for the development path.
     pub development_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AiWorker {
+    Python {
+        python: PathBuf,
+        script: PathBuf,
+    },
+    Native {
+        executable: PathBuf,
+        graphs: PathBuf,
+        runtime: PathBuf,
+    },
 }
 
 pub const ACCURATE_REENCODE_PROFILE: &str = "mp4_h264_standard_v1";
@@ -106,8 +120,19 @@ pub enum AudioSelection {
     One { stream_index: u32 },
     None,
 }
+/// Explicit, bounded pixel-space transform for a lossy transcode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoTransform {
+    pub rotation_degrees: u16,
+    pub scale_percent: u16,
+    pub offset_x: i32,
+    pub offset_y: i32,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueueCommand {
+    StoragePreview {
+        items: Vec<MediaRequest>,
+    },
     BatchSubmit {
         submission_id: String,
         items: Vec<MediaRequest>,
@@ -134,12 +159,24 @@ pub enum TrimStrategy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MediaRequest {
+    MixStems {
+        vocals: PathBuf,
+        accompaniment: PathBuf,
+        destination: PathBuf,
+        include_vocals: bool,
+        include_accompaniment: bool,
+    },
+    PrepareAudioPreview {
+        source: PathBuf,
+        destination: PathBuf,
+    },
     Transcode {
         source: PathBuf,
         destination: PathBuf,
         range: Option<MediaRange>,
         profile: TranscodeProfile,
         audio_selection: AudioSelection,
+        video_transform: Option<VideoTransform>,
     },
     Probe {
         source: PathBuf,
@@ -157,6 +194,8 @@ impl MediaRequest {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Probe { .. } => "probe",
+            Self::PrepareAudioPreview { .. } => "prepare_audio_preview",
+            Self::MixStems { .. } => "mix_stems",
             Self::Transcode { .. } => "transcode",
             Self::Trim { .. } => "trim",
         }
@@ -255,6 +294,8 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
             "accurate_reencode_timeout_ms",
             "core003_enabled",
             "core004_enabled",
+            "video_transform_enabled",
+            "mix_stems_enabled",
             "transcode_timeout_ms",
             "max_output_bytes",
             "ai_backend",
@@ -291,11 +332,21 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         None => false,
         Some(v) => v.as_bool().ok_or(CoreError::InvalidArgument)?,
     };
+    let video_transform_enabled = match map.get("video_transform_enabled") {
+        None => false,
+        Some(value) => value.as_bool().ok_or(CoreError::InvalidArgument)?,
+    };
+    let mix_stems_enabled = match map.get("mix_stems_enabled") {
+        None => false,
+        Some(v) => v.as_bool().ok_or(CoreError::InvalidArgument)?,
+    };
     let transcode_timeout_ms = match map.get("transcode_timeout_ms") {
         None => 600_000,
         Some(v) => v.as_u64().ok_or(CoreError::InvalidArgument)?,
     };
-    if core004_enabled && !core003_enabled {
+    if (core004_enabled && !core003_enabled)
+        || ((video_transform_enabled || mix_stems_enabled) && !core004_enabled)
+    {
         return Err(CoreError::InvalidArgument);
     }
     let ai_backend = map.get("ai_backend").map(parse_ai_backend).transpose()?;
@@ -316,6 +367,8 @@ fn parse_backend(value: &Value) -> Result<BackendConfig, CoreError> {
         accurate_reencode_timeout_ms,
         core003_enabled,
         core004_enabled,
+        video_transform_enabled,
+        mix_stems_enabled,
         transcode_timeout_ms,
         max_output_bytes: max_output_bytes as usize,
         ai_backend,
@@ -329,6 +382,9 @@ fn parse_ai_backend(value: &Value) -> Result<AiBackendConfig, CoreError> {
         &[
             "python",
             "worker",
+            "native_worker",
+            "native_graphs",
+            "native_runtime",
             "model",
             "timeout_ms",
             "development_root",
@@ -356,9 +412,26 @@ fn parse_ai_backend(value: &Value) -> Result<AiBackendConfig, CoreError> {
         .get("development_root")
         .map(|_| path("development_root"))
         .transpose()?;
+    let native = ["native_worker", "native_graphs", "native_runtime"]
+        .iter()
+        .any(|key| map.contains_key(*key));
+    let worker = if native {
+        if map.contains_key("python") || map.contains_key("worker") {
+            return Err(CoreError::InvalidArgument);
+        }
+        AiWorker::Native {
+            executable: path("native_worker")?,
+            graphs: path("native_graphs")?,
+            runtime: path("native_runtime")?,
+        }
+    } else {
+        AiWorker::Python {
+            python: path("python")?,
+            script: path("worker")?,
+        }
+    };
     Ok(AiBackendConfig {
-        python: path("python")?,
-        worker: path("worker")?,
+        worker,
         model: path("model")?,
         timeout_ms,
         development_root,
@@ -438,12 +511,20 @@ pub fn parse_request_with_ai(input: &[u8], ai_enabled: bool) -> Result<Request, 
     {
         "mock" => parse_mock_request(input).map(Request::Mock),
         "transcode" => parse_transcode(&map).map(Request::Media),
-        "batch_submit" => {
+        operation @ ("batch_submit" | "storage_preview") => {
             allowed_fields(
                 &map,
-                &["schema_version", "operation", "submission_id", "items"],
+                if operation == "batch_submit" {
+                    &["schema_version", "operation", "submission_id", "items"]
+                } else {
+                    &["schema_version", "operation", "items"]
+                },
             )?;
-            let submission_id = parse_submission_id(map.get("submission_id"))?;
+            let submission_id = if operation == "batch_submit" {
+                Some(parse_submission_id(map.get("submission_id"))?)
+            } else {
+                None
+            };
             let items = map
                 .get("items")
                 .and_then(Value::as_array)
@@ -464,9 +545,12 @@ pub fn parse_request_with_ai(input: &[u8], ai_enabled: bool) -> Result<Request, 
                     _ => return Err(CoreError::InvalidArgument),
                 }
             }
-            Ok(Request::Queue(QueueCommand::BatchSubmit {
-                submission_id,
-                items: parsed,
+            Ok(Request::Queue(match submission_id {
+                Some(submission_id) => QueueCommand::BatchSubmit {
+                    submission_id,
+                    items: parsed,
+                },
+                None => QueueCommand::StoragePreview { items: parsed },
             }))
         }
         "queue_snapshot" => {
@@ -544,6 +628,59 @@ pub fn parse_request_with_ai(input: &[u8], ai_enabled: bool) -> Result<Request, 
                 source: uri_path(map.get("source").ok_or(CoreError::InvalidArgument)?)?,
                 destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
             })
+        }
+        "mix_stems" => {
+            allowed_fields(
+                &map,
+                &[
+                    "schema_version",
+                    "operation",
+                    "vocals",
+                    "accompaniment",
+                    "destination",
+                    "include_vocals",
+                    "include_accompaniment",
+                ],
+            )?;
+            let include_vocals = map
+                .get("include_vocals")
+                .and_then(Value::as_bool)
+                .ok_or(CoreError::InvalidArgument)?;
+            let include_accompaniment = map
+                .get("include_accompaniment")
+                .and_then(Value::as_bool)
+                .ok_or(CoreError::InvalidArgument)?;
+            if !include_vocals && !include_accompaniment {
+                return Err(CoreError::InvalidArgument);
+            }
+            Ok(Request::Media(MediaRequest::MixStems {
+                vocals: uri_path(map.get("vocals").ok_or(CoreError::InvalidArgument)?)?,
+                accompaniment: uri_path(
+                    map.get("accompaniment").ok_or(CoreError::InvalidArgument)?,
+                )?,
+                destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
+                include_vocals,
+                include_accompaniment,
+            }))
+        }
+        "prepare_audio_preview" => {
+            allowed_fields(
+                &map,
+                &[
+                    "schema_version",
+                    "operation",
+                    "source",
+                    "destination",
+                    "profile",
+                ],
+            )?;
+            if map.get("profile").and_then(Value::as_str) != Some("wav_pcm_f32_preview_v1") {
+                return Err(CoreError::InvalidArgument);
+            }
+            Ok(Request::Media(MediaRequest::PrepareAudioPreview {
+                source: uri_path(map.get("source").ok_or(CoreError::InvalidArgument)?)?,
+                destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
+            }))
         }
         "probe" => {
             allowed_fields(&map, &["schema_version", "operation", "source"])?;
@@ -670,6 +807,7 @@ fn parse_transcode(map: &Map<String, Value>) -> Result<MediaRequest, CoreError> 
             "range",
             "profile",
             "audio_selection",
+            "video_transform",
         ],
     )?;
     let profile = match map.get("profile").and_then(Value::as_str) {
@@ -715,12 +853,54 @@ fn parse_transcode(map: &Map<String, Value>) -> Result<MediaRequest, CoreError> 
             Ok(MediaRange { start_us, end_us })
         })
         .transpose()?;
+    let video_transform = map
+        .get("video_transform")
+        .map(|value| {
+            let transform = value.as_object().ok_or(CoreError::InvalidArgument)?;
+            allowed_fields(
+                transform,
+                &["rotation_degrees", "scale_percent", "offset_x", "offset_y"],
+            )?;
+            let rotation = transform
+                .get("rotation_degrees")
+                .and_then(Value::as_i64)
+                .ok_or(CoreError::InvalidArgument)?;
+            let scale = transform
+                .get("scale_percent")
+                .and_then(Value::as_i64)
+                .ok_or(CoreError::InvalidArgument)?;
+            let x = transform
+                .get("offset_x")
+                .and_then(Value::as_i64)
+                .ok_or(CoreError::InvalidArgument)?;
+            let y = transform
+                .get("offset_y")
+                .and_then(Value::as_i64)
+                .ok_or(CoreError::InvalidArgument)?;
+            if ![0, 90, 180, 270].contains(&rotation)
+                || !(100..=200).contains(&scale)
+                || !(-1920..=1920).contains(&x)
+                || !(-1920..=1920).contains(&y)
+                || x % 2 != 0
+                || y % 2 != 0
+            {
+                return Err(CoreError::InvalidArgument);
+            }
+            Ok(VideoTransform {
+                rotation_degrees: rotation as u16,
+                scale_percent: scale as u16,
+                offset_x: x as i32,
+                offset_y: y as i32,
+            })
+        })
+        .transpose()?;
     Ok(MediaRequest::Transcode {
         source: uri_path(map.get("source").ok_or(CoreError::InvalidArgument)?)?,
         destination: uri_path(map.get("destination").ok_or(CoreError::InvalidArgument)?)?,
         range,
         profile,
         audio_selection,
+        video_transform,
     })
 }
 

@@ -1,0 +1,187 @@
+--- a/common/frame.c
++++ b/common/frame.c
+@@ -59,6 +59,7 @@
+ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
+ {
+     x264_frame_t *frame;
++    int mutex_initialized = 0;
+     int i_csp = frame_internal_csp( h->param.i_csp );
+     int i_mb_count = h->mb.i_mb_count;
+     int i_stride, i_width, i_lines, luma_plane_count;
+@@ -295,6 +296,7 @@
+ 
+     if( x264_pthread_mutex_init( &frame->mutex, NULL ) )
+         goto fail;
++    mutex_initialized = 1;
+     if( x264_pthread_cond_init( &frame->cv, NULL ) )
+         goto fail;
+ 
+@@ -305,6 +307,12 @@
+     return frame;
+ 
+ fail:
++    if( frame )
++    {
++        if( mutex_initialized )
++            x264_pthread_mutex_destroy( &frame->mutex );
++        x264_free( frame->base );
++    }
+     x264_free( frame );
+     return NULL;
+ }
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1514,6 +1514,18 @@
+     int shared_contexts_started = 0;
+     int threadpool_initialized = 0;
+     int lookaheadpool_initialized = 0;
++    int thread_contexts_allocated = 0;
++    int lookahead_contexts_allocated = 0;
++    int encoding_contexts_entered = 0;
++    int lookahead_initialized = 0;
++    int ratecontrol_initialized = 0;
++    enum
++    {
++        OPEN_MUTEX = 1, OPEN_CV = 2, OPEN_FDEC = 4,
++        OPEN_BITSTREAM = 8, OPEN_NAL = 16, OPEN_CACHE = 32,
++        OPEN_MB_THREAD = 64
++    };
++    unsigned thread_state[X264_THREAD_MAX] = { 0 };
+ 
+     CHECKED_MALLOCZERO( h, sizeof(x264_t) );
+ 
+@@ -1772,11 +1784,15 @@
+ 
+     h->thread[0] = h;
+     for( int i = 1; i < h->param.i_threads + !!h->param.i_sync_lookahead; i++ )
++    {
+         CHECKED_MALLOC( h->thread[i], sizeof(x264_t) );
++        thread_contexts_allocated++;
++    }
+     if( h->param.i_lookahead_threads > 1 )
+         for( int i = 0; i < h->param.i_lookahead_threads; i++ )
+         {
+             CHECKED_MALLOC( h->lookahead_thread[i], sizeof(x264_t) );
++            lookahead_contexts_allocated++;
+             *h->lookahead_thread[i] = *h;
+         }
+     *h->reconfig_h = *h;
+@@ -1788,27 +1804,39 @@
+         if( i > 0 )
+             *h->thread[i] = *h;
+ 
++        encoding_contexts_entered++;
+         if( x264_pthread_mutex_init( &h->thread[i]->mutex, NULL ) )
+             goto fail;
++        thread_state[i] |= OPEN_MUTEX;
+         if( x264_pthread_cond_init( &h->thread[i]->cv, NULL ) )
+             goto fail;
++        thread_state[i] |= OPEN_CV;
+ 
+         if( allocate_threadlocal_data )
+         {
+             h->thread[i]->fdec = x264_frame_pop_unused( h, 1 );
+             if( !h->thread[i]->fdec )
+                 goto fail;
++            thread_state[i] |= OPEN_FDEC;
+         }
+         else
+             h->thread[i]->fdec = h->thread[0]->fdec;
+ 
+         CHECKED_MALLOC( h->thread[i]->out.p_bitstream, h->out.i_bitstream );
++        thread_state[i] |= OPEN_BITSTREAM;
+         /* Start each thread with room for init_nal_count NAL units; it'll realloc later if needed. */
+         CHECKED_MALLOC( h->thread[i]->out.nal, init_nal_count*sizeof(x264_nal_t) );
++        thread_state[i] |= OPEN_NAL;
+         h->thread[i]->out.i_nals_allocated = init_nal_count;
+ 
+-        if( allocate_threadlocal_data && x264_macroblock_cache_allocate( h->thread[i] ) < 0 )
+-            goto fail;
++        if( allocate_threadlocal_data )
++        {
++            /* A copied context may still carry the previous owner's base. */
++            h->thread[i]->mb.base = NULL;
++            if( x264_macroblock_cache_allocate( h->thread[i] ) < 0 )
++                goto fail;
++            thread_state[i] |= OPEN_CACHE;
++        }
+     }
+ 
+ #if HAVE_OPENCL
+@@ -1818,13 +1846,18 @@
+ 
+     if( x264_lookahead_init( h, i_slicetype_length ) )
+         goto fail;
++    lookahead_initialized = 1;
+ 
+     for( int i = 0; i < h->param.i_threads; i++ )
++    {
+         if( x264_macroblock_thread_allocate( h->thread[i], 0 ) < 0 )
+             goto fail;
++        thread_state[i] |= OPEN_MB_THREAD;
++    }
+ 
+     if( x264_ratecontrol_new( h ) < 0 )
+         goto fail;
++    ratecontrol_initialized = 1;
+ 
+     if( h->param.i_nal_hrd )
+     {
+@@ -1873,14 +1906,53 @@
+ fail:
+     if( h != NULL )
+     {
+-        /* Only the exclusive prefix and fully initialized idle pools are
+-         * safe here. Shared contexts need separate staged teardown. */
+-        if( !shared_contexts_started )
+-        {
++        /* No encoder has been published and no frames/jobs have been submitted.
++         * OpenCL owns additional platform state and keeps its prior bounded
++         * cleanup until that lifecycle has a separately reviewed abort. */
++        if( !shared_contexts_started || !HAVE_OPENCL )
++        {
++            if( !HAVE_OPENCL && lookahead_initialized )
++            {
++                /* Complete empty queues; stop/join before borrowed data dies. */
++                x264_lookahead_delete( h );
++                h->lookahead = NULL;
++                if( h->param.i_sync_lookahead )
++                    h->thread[h->param.i_threads] = NULL;
++            }
+             if( lookaheadpool_initialized )
+                 x264_threadpool_delete( h->lookaheadpool );
+             if( threadpool_initialized )
+                 x264_threadpool_delete( h->threadpool );
++            if( !HAVE_OPENCL )
++            {
++                /* No-commit RC abort supports no-stats/no-zones only. Other RC
++                 * modes retain their explicit technical cleanup gap. */
++                if( ratecontrol_initialized )
++                    x264_ratecontrol_abort_open( h );
++                /* Counts, not unvalidated input thread limits, bound rollback. */
++                for( int i = encoding_contexts_entered - 1; i >= 0; i-- )
++                {
++                    unsigned state = thread_state[i];
++                    if( state & OPEN_MB_THREAD )
++                        x264_macroblock_thread_free( h->thread[i], 0 );
++                    if( state & OPEN_CACHE )
++                        x264_macroblock_cache_free( h->thread[i] );
++                    if( state & OPEN_FDEC )
++                        x264_frame_delete( h->thread[i]->fdec );
++                    if( state & OPEN_NAL )
++                        x264_free( h->thread[i]->out.nal );
++                    if( state & OPEN_BITSTREAM )
++                        x264_free( h->thread[i]->out.p_bitstream );
++                    if( state & OPEN_CV )
++                        x264_pthread_cond_destroy( &h->thread[i]->cv );
++                    if( state & OPEN_MUTEX )
++                        x264_pthread_mutex_destroy( &h->thread[i]->mutex );
++                }
++                for( int i = 0; i < lookahead_contexts_allocated; i++ )
++                    x264_free( h->lookahead_thread[i] );
++                for( int i = 1; i <= thread_contexts_allocated; i++ )
++                    x264_free( h->thread[i] );
++            }
+             if( costs_started )
+                 x264_analyse_free_costs( h );
+             x264_free( h->cost_table );

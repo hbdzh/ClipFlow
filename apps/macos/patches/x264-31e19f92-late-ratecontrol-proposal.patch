@@ -1,0 +1,66 @@
+--- a/encoder/ratecontrol.c
++++ b/encoder/ratecontrol.c
+@@ -793,7 +793,7 @@
+         if( bits_required >= 63 )
+         {
+             x264_log( h, X264_LOG_ERROR, "HRD with very large timescale and bufsize not supported\n" );
+-            return -1;
++            goto fail;
+         }
+     }
+ 
+@@ -1212,6 +1212,9 @@
+ 
+     return 0;
+ fail:
++    /* Before publication only h owns rc; lookahead has no queued frames and
++     * its extra context was copied before RC construction with rc == NULL. */
++    x264_ratecontrol_abort_open( h );
+     return -1;
+ }
+ 
+@@ -1352,6 +1355,30 @@
+                   qscale2qp( pow( base_cplx, 1 - rc->qcompress )
+                              * rc->cplxr_sum / rc->wanted_bits_window ) - mbtree_offset - QP_BD_OFFSET );
+     }
++}
++
++int x264_ratecontrol_abort_open( x264_t *h )
++{
++    x264_ratecontrol_t *rc = h->rc;
++    if( !rc )
++        return 0;
++
++    /* The fixed product presets never transfer zone parameters or open stats
++     * files. Those optional owners need a separate staged abort contract;
++     * successful-close may publish files and is not an abort operation. */
++    if( h->param.rc.b_stat_read || h->param.rc.b_stat_write ||
++        h->param.rc.i_zones || h->param.rc.psz_zones )
++        return -1;
++
++    /* The rc array is zeroed before the first fallible step. On this path
++     * only these two allocations are made; per-thread copies borrow them. */
++    for( int i = 0; i < h->param.i_threads; i++ )
++        h->thread[i]->rc = NULL;
++    x264_free( rc->pred );
++    x264_free( rc->pred_b_from_p );
++    x264_free( rc );
++    h->rc = NULL;
++    return 0;
+ }
+ 
+ void x264_ratecontrol_delete( x264_t *h )
+--- a/encoder/ratecontrol.h
++++ b/encoder/ratecontrol.h
+@@ -41,6 +41,11 @@
+ 
+ #define x264_ratecontrol_new x264_template(ratecontrol_new)
+ int  x264_ratecontrol_new   ( x264_t * );
++/* Encoder-open abort only, before frames/jobs are submitted, with all encoder
++ * contexts initialized and no RC user active. Returns -1 for optional stats/
++ * zones owners, leaving h->rc unchanged instead of using commit-on-close. */
++#define x264_ratecontrol_abort_open x264_template(ratecontrol_abort_open)
++int  x264_ratecontrol_abort_open( x264_t * );
+ #define x264_ratecontrol_delete x264_template(ratecontrol_delete)
+ void x264_ratecontrol_delete( x264_t * );
+ 

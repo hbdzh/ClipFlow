@@ -1,0 +1,42 @@
+--- a/onnxruntime/core/util/math_cpu.cc
++++ b/onnxruntime/core/util/math_cpu.cc
+@@ -20,6 +20,7 @@
+ #include "core/framework/float16.h"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <type_traits>
+ #include "core/common/narrow.h"
+ #include "core/mlas/inc/mlas.h"
+@@ -856,28 +857,13 @@
+ SPECIALIZED_COPYVECTOR(float)
+ #undef SPECIALIZED_COPYVECTOR
+ 
+-// like C++20's std::bit_cast
+-// adapted from the example implementation here: https://en.cppreference.com/w/cpp/numeric/bit_cast
+-// TODO replace this with std::bit_cast when we move to C++20
+-template <typename Dst, typename Src>
+-static std::enable_if_t<
+-    sizeof(Src) == sizeof(Dst) &&
+-        std::is_trivially_copyable_v<Src> &&
+-        std::is_trivially_copyable_v<Dst> &&
+-        std::is_trivially_constructible_v<Dst>,
+-    Dst>
+-BitCast(const Src& src) {
+-  Dst dst;
+-  std::memcpy(&dst, &src, sizeof(dst));
+-  return dst;
+-}
+-
++// MediaStudio controlled build: use C++20 std::bit_cast for object representation.
+ uint16_t floatToHalf(float f) {
+-  return BitCast<uint16_t>(Eigen::half_impl::float_to_half_rtne(f).x);
++  return std::bit_cast<uint16_t>(Eigen::half_impl::float_to_half_rtne(f).x);
+ }
+ 
+ uint16_t doubleToHalf(double f) {
+-  return BitCast<uint16_t>(Eigen::half_impl::float_to_half_rtne(static_cast<float>(f)).x);
++  return std::bit_cast<uint16_t>(Eigen::half_impl::float_to_half_rtne(static_cast<float>(f)).x);
+ }
+ 
+ float halfToFloat(uint16_t h) {

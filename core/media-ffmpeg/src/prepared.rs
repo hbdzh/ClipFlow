@@ -50,7 +50,9 @@ fn processing_budget(config: &BackendConfig, request: &MediaRequest) -> std::tim
             strategy: TrimStrategy::AccurateReencode,
             ..
         } => config.accurate_reencode_timeout_ms,
-        MediaRequest::Transcode { .. } => config.transcode_timeout_ms,
+        MediaRequest::Transcode { .. }
+        | MediaRequest::PrepareAudioPreview { .. }
+        | MediaRequest::MixStems { .. } => config.transcode_timeout_ms,
     })
 }
 fn remaining_budget(
@@ -73,6 +75,240 @@ fn resource() -> MediaError {
         "Storage or retained execution plan budget is unavailable.",
     )
 }
+
+fn output_budget(duration_us: i64) -> Result<u64, MediaError> {
+    if duration_us <= 0 {
+        return Err(resource());
+    }
+    let budget = u64::try_from((i128::from(duration_us) * 4_100_000 + 999_999) / 1_000_000)
+        .map_err(|_| resource())?
+        .checked_add(16 * 1024 * 1024)
+        .ok_or_else(resource)?;
+    if budget > 3 * 1024 * 1024 * 1024 {
+        return Err(resource());
+    }
+    Ok(budget)
+}
+
+fn reservation_bytes(budget: u64) -> Result<u64, MediaError> {
+    budget
+        .checked_mul(2)
+        .and_then(|b| b.checked_add(FLOOR))
+        .ok_or_else(resource)
+}
+
+fn required_storage(reserved: u64, additional: u64) -> Result<u64, MediaError> {
+    reserved
+        .checked_add(additional)
+        .and_then(|b| b.checked_add(FLOOR))
+        .ok_or_else(resource)
+}
+
+struct PreviewVolume {
+    identity: String,
+    item_indices: Vec<usize>,
+    estimated: u64,
+    reservation: u64,
+    available: u64,
+}
+
+fn preview_volumes(
+    groups: Vec<PreviewVolume>,
+    existing: &BTreeMap<String, u64>,
+    errors: &mut Vec<Value>,
+) -> Vec<Value> {
+    let mut volumes = Vec::new();
+    for (volume_index, group) in groups.into_iter().enumerate() {
+        let required = match required_storage(
+            existing.get(&group.identity).copied().unwrap_or(0),
+            group.reservation,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(json!({"index":group.item_indices[0],"code":error.code,"message":error.message}));
+                continue;
+            }
+        };
+        let sufficient = group.available >= required;
+        if !sufficient {
+            for &index in &group.item_indices {
+                errors.push(json!({"index":index,"code":"OUT_OF_DISK","message":"Insufficient unreserved output storage."}));
+            }
+        }
+        volumes.push(
+            json!({"volume_index":volume_index,"item_indices":group.item_indices,
+            "estimated_output_bytes":group.estimated,"available_storage_bytes":group.available,
+            "required_storage_bytes":required,"sufficient":sufficient}),
+        );
+    }
+    volumes
+}
+
+fn preview_item(
+    context: &Context<'_>,
+    request: &MediaRequest,
+) -> Result<(String, u64, u64), MediaError> {
+    context.check()?;
+    let (path, destination) = match request {
+        MediaRequest::Trim {
+            source,
+            destination,
+            ..
+        }
+        | MediaRequest::Transcode {
+            source,
+            destination,
+            ..
+        } => (source, destination),
+        MediaRequest::Probe { .. }
+        | MediaRequest::PrepareAudioPreview { .. }
+        | MediaRequest::MixStems { .. } => {
+            return Err(MediaError::new(
+                "INVALID_INPUT",
+                "Storage preview requires an export request.",
+            ));
+        }
+    };
+    let source = Source::open(path)?;
+    let media = media::inspect(context, &source.path)?;
+    let destination = files::destination(&source, destination)?;
+    let identity = parent_identity(&destination)?;
+    let (start, end) = match request {
+        MediaRequest::Trim {
+            start_us, end_us, ..
+        } => (*start_us, *end_us),
+        MediaRequest::Transcode { range, .. } => range
+            .as_ref()
+            .map_or((0, media.duration_us), |r| (r.start_us, r.end_us)),
+        MediaRequest::Probe { .. }
+        | MediaRequest::PrepareAudioPreview { .. }
+        | MediaRequest::MixStems { .. } => unreachable!(),
+    };
+    if start < 0 || end <= start || end > media.duration_us {
+        return Err(MediaError::new(
+            "INVALID_INPUT",
+            "Requested range is outside the source timeline.",
+        ));
+    }
+    let budget = output_budget(end - start)?;
+    let (volume, available) = storage(context, &destination)?;
+    source.unchanged()?;
+    if parent_identity(&destination)? != identity {
+        return Err(MediaError::new(
+            "SOURCE_CHANGED",
+            "Output directory identity changed during preview.",
+        ));
+    }
+    context.check()?;
+    Ok((volume, budget, available))
+}
+
+/// Read-only space observation. No plan/target/storage leases are created and
+/// no staging directory is written. The caller serializes queue admissions.
+pub fn storage_preview(
+    config: &BackendConfig,
+    requests: &[MediaRequest],
+    cancel: &AtomicBool,
+) -> Value {
+    let response = |volumes: Vec<Value>, errors: Vec<Value>| json!({"schema_version":0,"operation":"storage_preview","ready":errors.is_empty(),"volumes":volumes,"errors":errors});
+    let failure = |index: usize, error: MediaError| json!({"index":index,"code":error.code,"message":error.message});
+    if requests.is_empty() || requests.len() > 32 {
+        return response(
+            vec![],
+            vec![failure(
+                0,
+                MediaError::new(
+                    "INVALID_INPUT",
+                    "Storage preview requires one to 32 export requests.",
+                ),
+            )],
+        );
+    }
+    if !config.core003_enabled || !config.core004_enabled || !cfg!(target_os = "macos") {
+        return response(
+            vec![],
+            vec![failure(
+                0,
+                MediaError::new(
+                    "UNSUPPORTED_BACKEND",
+                    "Storage preview requires the accepted CORE-004 backend.",
+                ),
+            )],
+        );
+    }
+    if quarantined() {
+        return response(
+            vec![],
+            vec![failure(
+                0,
+                MediaError::new("CLEANUP_FAILED", "Backend cleanup remains unconfirmed."),
+            )],
+        );
+    }
+    // One shared timeout bounds the entire observation, not 32 fresh deadlines.
+    let context = Context::new(config, cancel);
+    if let Err(error) = crate::tools(&context) {
+        return response(vec![], vec![failure(0, error)]);
+    }
+    let mut groups: Vec<PreviewVolume> = Vec::new();
+    let mut errors = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        match preview_item(&context, request) {
+            Ok((identity, budget, available)) => {
+                let group_index = groups.iter().position(|g| g.identity == identity);
+                let reserve = match reservation_bytes(budget) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        errors.push(failure(index, error));
+                        continue;
+                    }
+                };
+                if let Some(group_index) = group_index {
+                    let group = &mut groups[group_index];
+                    match (
+                        group.estimated.checked_add(budget),
+                        group.reservation.checked_add(reserve),
+                    ) {
+                        (Some(estimated), Some(reservation)) => {
+                            group.item_indices.push(index);
+                            group.estimated = estimated;
+                            group.reservation = reservation;
+                            group.available = group.available.min(available);
+                        }
+                        _ => errors.push(failure(index, resource())),
+                    }
+                } else {
+                    groups.push(PreviewVolume {
+                        identity,
+                        item_indices: vec![index],
+                        estimated: budget,
+                        reservation: reserve,
+                        available,
+                    });
+                }
+            }
+            Err(error) => errors.push(failure(index, error)),
+        }
+    }
+    if let Err(error) = context.check() {
+        return response(vec![], vec![failure(0, error)]);
+    }
+    if quarantined() {
+        return response(
+            vec![],
+            vec![failure(
+                0,
+                MediaError::new("CLEANUP_FAILED", "Backend cleanup remains unconfirmed."),
+            )],
+        );
+    }
+    let existing = match ledger().lock() {
+        Ok(value) => value,
+        Err(_) => return response(vec![], vec![failure(0, resource())]),
+    };
+    let volumes = preview_volumes(groups, &existing, &mut errors);
+    response(volumes, errors)
+}
 struct Lease {
     volume: String,
     bytes: u64,
@@ -91,11 +327,14 @@ impl Drop for Lease {
 }
 pub struct PreparedMedia {
     quarantined: AtomicBool,
+    mix_published: AtomicBool,
     processing_budget: std::time::Duration,
     preflight_elapsed: std::time::Duration,
     request: MediaRequest,
     source: Source,
-    media: Media,
+    secondary_source: Option<Source>,
+    media: Option<Media>,
+    probe_info: Option<Value>,
     destination: Option<PathBuf>,
     parent_identity: Option<String>,
     volume: String,
@@ -126,6 +365,10 @@ pub fn resource_snapshot() -> Value {
     json!({"reserved_storage_bytes":bytes,"reserved_target_count":targets,"estimated_retained_plan_bytes":plan,"quarantined":quarantined()||bytes.is_none()||targets.is_none()||plan.is_none()})
 }
 impl PreparedMedia {
+    pub fn mix_published(&self) -> bool {
+        self.mix_published
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
     pub fn mark_quarantined(&self) {
         QUARANTINED.store(true, std::sync::atomic::Ordering::Release);
         self.quarantined
@@ -157,7 +400,7 @@ impl PreparedMedia {
         json!({"estimated_output_bytes":self.budget,"reserved_storage_bytes":self._lease.as_ref().map_or(0,|l|l.bytes),"available_storage_bytes_at_preflight":self.available,"estimated_retained_plan_bytes":self.retained,"transcode_plan":self.options.as_ref().map(|o|o.summary())})
     }
 }
-fn parent_identity(path: &Path) -> Result<String, MediaError> {
+pub(crate) fn parent_identity(path: &Path) -> Result<String, MediaError> {
     let meta = std::fs::metadata(path.parent().ok_or_else(resource)?)
         .map_err(|_| MediaError::new("PERMISSION_DENIED", "Output directory is unavailable."))?;
     #[cfg(unix)]
@@ -281,6 +524,155 @@ pub fn destinations_equivalent(a: &Path, b: &Path) -> Result<bool, MediaError> {
     }
     aliases_reserved(a, &BTreeMap::from([(b.to_path_buf(), b_parent)]))
 }
+fn preflight_audio_preview(
+    request: &MediaRequest,
+    source: Source,
+    secondary_source: Option<Source>,
+    destination: &Path,
+    context: &Context<'_>,
+    started: std::time::Instant,
+    processing_budget: std::time::Duration,
+) -> Result<PreparedMedia, MediaError> {
+    let info = crate::audio_probe::inspect(context, &source.path)?.ok_or_else(|| {
+        MediaError::new(
+            "UNSUPPORTED_FORMAT",
+            "PCM preview requires supported audio-only input.",
+        )
+    })?;
+    let count = media::integer(&info["sample_count"])?;
+    let channels = media::integer(&info["streams"][0]["channels"])?;
+    if let Some(second) = &secondary_source {
+        if !context.config.mix_stems_enabled {
+            return Err(MediaError::new(
+                "UNSUPPORTED_OPERATION",
+                "Mix export requires explicit backend opt-in.",
+            ));
+        }
+        if second.identity() == source.identity() {
+            return Err(MediaError::new(
+                "INVALID_INPUT",
+                "Stem inputs must be distinct files.",
+            ));
+        }
+        let second_info = crate::audio_probe::inspect(context, &second.path)?.ok_or_else(|| {
+            MediaError::new(
+                "UNSUPPORTED_FORMAT",
+                "Mix requires two compatible float WAV stems.",
+            )
+        })?;
+        let second_count = media::integer(&second_info["sample_count"])?;
+        let rate = media::integer(&info["streams"][0]["sample_rate"])?;
+        let second_rate = media::integer(&second_info["streams"][0]["sample_rate"])?;
+        let second_channels = media::integer(&second_info["streams"][0]["channels"])?;
+        if rate != 44100
+            || channels != 2
+            || second_rate != rate
+            || second_channels != channels
+            || second_count != count
+        {
+            return Err(MediaError::new(
+                "INVALID_INPUT",
+                "Stem sample rates, channels and lengths must match.",
+            ));
+        }
+        crate::audio_preview::validate(context, &source.path, rate, channels, count)?;
+        crate::audio_preview::validate(context, &second.path, rate, channels, count)?;
+        source.unchanged()?;
+        second.unchanged()?;
+    }
+    let budget = u64::try_from(count)
+        .map_err(|_| resource())?
+        .checked_mul(u64::try_from(channels).map_err(|_| resource())?)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_add(4096))
+        .ok_or_else(resource)?;
+    let dest = files::wav_destination(&source, destination)?;
+    let parent = parent_identity(&dest)?;
+    let mut probe = Temporary::new(&dest)?;
+    if let Err(error) = probe.cleanup() {
+        QUARANTINED.store(true, std::sync::atomic::Ordering::Release);
+        return Err(error);
+    }
+    let (volume, available) = storage(context, &dest)?;
+    let reserve = reservation_bytes(budget)?;
+    let mut l = ledger().lock().map_err(|_| resource())?;
+    let total = l
+        .get(&volume)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(reserve)
+        .ok_or_else(resource)?;
+    if required_storage(total, 0).map_or(true, |v| v > available) {
+        return Err(MediaError::new(
+            "OUT_OF_DISK",
+            "Insufficient unreserved preview storage.",
+        ));
+    }
+    l.insert(volume.clone(), total);
+    let lease = Lease {
+        volume: volume.clone(),
+        bytes: reserve,
+    };
+    drop(l);
+    let mut targets = TARGETS
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .map_err(|_| resource())?;
+    if aliases_reserved(&dest, &targets)? {
+        return Err(MediaError::new(
+            "OUTPUT_RESERVED",
+            "Preview output is already reserved.",
+        ));
+    }
+    targets.insert(dest.clone(), parent.clone());
+    let target = TargetLease(dest.clone());
+    drop(targets);
+    let retained = serde_json::to_vec(&info)
+        .map_err(|_| resource())?
+        .len()
+        .saturating_mul(8)
+        .saturating_add(4096) as u64;
+    let mut total = PLAN_BYTES.lock().map_err(|_| resource())?;
+    let next = total.checked_add(retained).ok_or_else(resource)?;
+    if next > 128 * 1024 * 1024 {
+        return Err(resource());
+    }
+    *total = next;
+    drop(total);
+    let plan = PlanLease(retained);
+    source.unchanged()?;
+    context.check()?;
+    if parent_identity(&dest)? != parent {
+        return Err(MediaError::new(
+            "SOURCE_CHANGED",
+            "Preview directory identity changed during preflight.",
+        ));
+    }
+    let elapsed = started.elapsed();
+    remaining_budget(processing_budget, elapsed)?;
+    Ok(PreparedMedia {
+        quarantined: AtomicBool::new(false),
+        mix_published: AtomicBool::new(false),
+        processing_budget,
+        preflight_elapsed: elapsed,
+        request: request.clone(),
+        source,
+        secondary_source,
+        media: None,
+        probe_info: Some(info),
+        destination: Some(dest),
+        parent_identity: Some(parent),
+        volume,
+        budget,
+        available,
+        retained,
+        options: None,
+        _lease: Some(lease),
+        _plan: plan,
+        _target: Some(target),
+    })
+}
+
 pub fn preflight(
     config: &BackendConfig,
     request: &MediaRequest,
@@ -300,6 +692,25 @@ pub fn preflight(
             "CORE-004 requires explicit CORE-003 and CORE-004 opt-in.",
         ));
     }
+    if matches!(request, MediaRequest::MixStems { .. }) && !config.mix_stems_enabled {
+        return Err(MediaError::new(
+            "UNSUPPORTED_OPERATION",
+            "Mix export requires explicit backend opt-in.",
+        ));
+    }
+    if matches!(
+        request,
+        MediaRequest::Transcode {
+            video_transform: Some(_),
+            ..
+        }
+    ) && !config.video_transform_enabled
+    {
+        return Err(MediaError::new(
+            "UNSUPPORTED_OPERATION",
+            "Video transform requires explicit backend opt-in.",
+        ));
+    }
     if !cfg!(target_os = "macos") {
         return Err(MediaError::new(
             "UNSUPPORTED_BACKEND",
@@ -310,6 +721,15 @@ pub fn preflight(
     context.check()?;
     let (path, dest) = match request {
         MediaRequest::Probe { source } => (source, None),
+        MediaRequest::MixStems {
+            vocals,
+            destination,
+            ..
+        } => (vocals, Some(destination)),
+        MediaRequest::PrepareAudioPreview {
+            source,
+            destination,
+        } => (source, Some(destination)),
         MediaRequest::Trim {
             source,
             destination,
@@ -323,7 +743,89 @@ pub fn preflight(
     };
     let source = Source::open(path)?;
     crate::tools(&context)?;
-    let media = media::inspect(&context, &source.path)?;
+    if let MediaRequest::PrepareAudioPreview { destination, .. } = request {
+        return preflight_audio_preview(
+            request,
+            source,
+            None,
+            destination,
+            &context,
+            started,
+            processing_budget,
+        );
+    }
+    if let MediaRequest::MixStems {
+        accompaniment,
+        destination,
+        ..
+    } = request
+    {
+        if !config.mix_stems_enabled {
+            return Err(MediaError::new(
+                "UNSUPPORTED_OPERATION",
+                "Mix export requires explicit backend opt-in.",
+            ));
+        }
+        crate::audio_mix::check_dependencies(&context)?;
+        let second = Source::open(accompaniment)?;
+        return preflight_audio_preview(
+            request,
+            source,
+            Some(second),
+            destination,
+            &context,
+            started,
+            processing_budget,
+        );
+    }
+    if matches!(request, MediaRequest::Probe { .. })
+        && let Some(info) = crate::audio_probe::inspect(&context, &source.path)?
+    {
+        source.unchanged()?;
+        context.check()?;
+        let retained = serde_json::to_vec(&info)
+            .map_err(|_| resource())?
+            .len()
+            .saturating_mul(8)
+            .saturating_add(4096) as u64;
+        let mut total = PLAN_BYTES.lock().map_err(|_| resource())?;
+        let next = total.checked_add(retained).ok_or_else(resource)?;
+        if next > 128 * 1024 * 1024 {
+            return Err(resource());
+        }
+        *total = next;
+        drop(total);
+        let plan_lease = PlanLease(retained);
+        let elapsed = started.elapsed();
+        remaining_budget(processing_budget, elapsed)?;
+        return Ok(PreparedMedia {
+            quarantined: AtomicBool::new(false),
+            mix_published: AtomicBool::new(false),
+            processing_budget,
+            preflight_elapsed: elapsed,
+            request: request.clone(),
+            source,
+            secondary_source: None,
+            media: None,
+            probe_info: Some(info),
+            destination: None,
+            parent_identity: None,
+            volume: String::new(),
+            budget: 0,
+            available: 0,
+            retained,
+            options: None,
+            _lease: None,
+            _plan: plan_lease,
+            _target: None,
+        });
+    }
+    let mut media = media::inspect(&context, &source.path)?;
+    if matches!(request, MediaRequest::Probe { .. })
+        && let Some(rate) = media::verified_cfr_rate(&media)
+    {
+        media.info["video_cfr_rate"] = json!(rate);
+    }
     let mut target = None;
     let mut captured_parent = None;
     let mut options = None;
@@ -343,12 +845,21 @@ pub fn preflight(
                 ..
             } => {
                 if *strategy != TrimStrategy::AccurateReencode {
+                    if *strategy == TrimStrategy::StreamCopyV1 {
+                        scope::supported(&media)?;
+                    }
+                    // The copy planner needs the next keyframe's packet DTS for
+                    // non-EOF boundaries; inspect() only populates frames.
+                    media.packets = media::packet_info(&context, &source.path)?;
                     crate::trim::preflight(
                         &media,
                         *start_us,
                         *end_us,
                         *strategy != TrimStrategy::StreamCopy,
                     )?;
+                    // Execution re-reads packets after rechecking source identity.
+                    // Do not retain a potentially large preflight packet list.
+                    media.packets = Vec::new();
                 }
                 (*start_us, *end_us)
             }
@@ -363,16 +874,11 @@ pub fn preflight(
                 "Requested range is outside the source timeline.",
             ));
         }
-        budget = u64::try_from((i128::from(end - start) * 4_100_000 + 999_999) / 1_000_000)
-            .map_err(|_| resource())?
-            .checked_add(16 * 1024 * 1024)
-            .ok_or_else(resource)?;
-        if budget > 3 * 1024 * 1024 * 1024 {
-            return Err(resource());
-        }
+        budget = output_budget(end - start)?;
         if let MediaRequest::Transcode {
             profile,
             audio_selection,
+            video_transform,
             ..
         } = request
         {
@@ -383,6 +889,7 @@ pub fn preflight(
                 *profile,
                 audio_selection,
                 budget,
+                *video_transform,
             )?);
             transcode::preflight(&media, start, end, options.as_ref().ok_or_else(resource)?)?;
         }
@@ -400,10 +907,7 @@ pub fn preflight(
             return Err(error);
         }
         (volume, available) = storage(&context, &dest)?;
-        let reserve = budget
-            .checked_mul(2)
-            .and_then(|b| b.checked_add(FLOOR))
-            .ok_or_else(resource)?;
+        let reserve = reservation_bytes(budget)?;
         let mut l = ledger().lock().map_err(|_| resource())?;
         let total = l
             .get(&volume)
@@ -411,7 +915,7 @@ pub fn preflight(
             .unwrap_or(0)
             .checked_add(reserve)
             .ok_or_else(resource)?;
-        if total.checked_add(FLOOR).is_none_or(|v| v > available) {
+        if required_storage(total, 0).map_or(true, |v| v > available) {
             return Err(MediaError::new(
                 "OUT_OF_DISK",
                 "Insufficient unreserved output storage.",
@@ -477,11 +981,14 @@ pub fn preflight(
         preflight_elapsed,
         parent_identity,
         quarantined: AtomicBool::new(false),
+        mix_published: AtomicBool::new(false),
         _target: target,
         _plan: plan_lease,
         request: request.clone(),
         source,
-        media,
+        secondary_source: None,
+        media: Some(media),
+        probe_info: None,
         destination,
         volume,
         budget,
@@ -536,7 +1043,14 @@ fn execute_inner(
     context.check()?;
     prepared.source.unchanged()?;
     if let Some(dest) = &prepared.destination {
-        let current = files::destination(&prepared.source, dest)?;
+        let current = if matches!(
+            prepared.request,
+            MediaRequest::PrepareAudioPreview { .. } | MediaRequest::MixStems { .. }
+        ) {
+            files::wav_destination(&prepared.source, dest)?
+        } else {
+            files::destination(&prepared.source, dest)?
+        };
         if current != *dest || Some(parent_identity(dest)?) != prepared.parent_identity {
             return Err(MediaError::new(
                 "SOURCE_CHANGED",
@@ -557,16 +1071,46 @@ fn execute_inner(
             ));
         }
     }
+    if let MediaRequest::MixStems {
+        include_vocals,
+        include_accompaniment,
+        ..
+    } = &prepared.request
+    {
+        crate::tools(&context)?;
+        return crate::audio_mix::execute(
+            &context,
+            &prepared.source,
+            prepared.secondary_source.as_ref().ok_or_else(resource)?,
+            prepared.destination.as_deref().ok_or_else(resource)?,
+            prepared.probe_info.as_ref().ok_or_else(resource)?,
+            crate::audio_mix::MixOptions {
+                includes: (*include_vocals, *include_accompaniment),
+                published: &prepared.mix_published,
+                expected_parent: prepared.parent_identity.as_deref().ok_or_else(resource)?,
+            },
+        );
+    }
+    if let MediaRequest::PrepareAudioPreview { .. } = &prepared.request {
+        crate::tools(&context)?;
+        return crate::audio_preview::execute(
+            &context,
+            &prepared.source,
+            prepared.destination.as_deref().ok_or_else(resource)?,
+            prepared.probe_info.as_ref().ok_or_else(resource)?,
+        );
+    }
     if let MediaRequest::Transcode { range, .. } = &prepared.request {
-        let (s, e) = range
-            .as_ref()
-            .map_or((0, prepared.media.duration_us), |r| (r.start_us, r.end_us));
+        let (s, e) = range.as_ref().map_or(
+            (0, prepared.media.as_ref().ok_or_else(resource)?.duration_us),
+            |r| (r.start_us, r.end_us),
+        );
         crate::tools(&context)?;
         return accurate::execute_options(
             &context,
             &prepared.source,
             prepared.destination.as_deref().ok_or_else(resource)?,
-            prepared.media.clone(),
+            prepared.media.clone().ok_or_else(resource)?,
             s,
             e,
             prepared.options.as_ref(),
@@ -576,8 +1120,13 @@ fn execute_inner(
     match &prepared.request {
         MediaRequest::Probe { .. } => {
             prepared.source.unchanged()?;
-            Ok(
-                json!({"schema_version":0,"mock_only":false,"file_created":false,"media_info":prepared.media.info}),
+            crate::probe_result(
+                prepared
+                    .probe_info
+                    .as_ref()
+                    .or_else(|| prepared.media.as_ref().map(|m| &m.info))
+                    .ok_or_else(resource)?
+                    .clone(),
             )
         }
         MediaRequest::Trim {
@@ -592,7 +1141,7 @@ fn execute_inner(
                     &context,
                     &prepared.source,
                     dest,
-                    prepared.media.clone(),
+                    prepared.media.clone().ok_or_else(resource)?,
                     *start_us,
                     *end_us,
                 ),
@@ -600,7 +1149,7 @@ fn execute_inner(
                     &context,
                     &prepared.source,
                     dest,
-                    prepared.media.clone(),
+                    prepared.media.clone().ok_or_else(resource)?,
                     *start_us,
                     *end_us,
                     *strategy == TrimStrategy::StreamCopyV1,
@@ -614,6 +1163,46 @@ fn execute_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_preview_budget_and_batch_requirement_share_admission_policy() {
+        let budget = output_budget(1_500_000).expect("budget");
+        assert_eq!(budget, 6_150_000 + 16 * 1024 * 1024);
+        let item_reserve = reservation_bytes(budget).expect("reservation");
+        assert_eq!(item_reserve, 2 * budget + FLOOR);
+        let existing = 123_456;
+        let same_volume_batch = item_reserve.checked_mul(2).expect("batch");
+        let required = required_storage(existing, same_volume_batch).expect("required");
+        assert_eq!(required, existing + 4 * budget + 3 * FLOOR);
+        assert_eq!(required, 293_158_912);
+        for available in [293_158_912, 293_158_911] {
+            let groups = vec![PreviewVolume {
+                identity: "same-volume".into(),
+                item_indices: vec![0, 1],
+                estimated: 2 * budget,
+                reservation: same_volume_batch,
+                available,
+            }];
+            let mut errors = vec![];
+            let volumes = preview_volumes(
+                groups,
+                &BTreeMap::from([("same-volume".into(), existing)]),
+                &mut errors,
+            );
+            assert_eq!(volumes[0]["required_storage_bytes"], 293_158_912_u64);
+            assert_eq!(volumes[0]["sufficient"], available == 293_158_912);
+            if available == 293_158_912 {
+                assert!(errors.is_empty());
+            } else {
+                assert_eq!(errors.len(), 2);
+                assert_eq!(errors[0]["code"], "OUT_OF_DISK");
+                assert_eq!(errors[1]["index"], 1);
+            }
+        }
+        assert!(output_budget(0).is_err());
+        assert!(output_budget(i64::MAX).is_err());
+        assert!(required_storage(u64::MAX, 1).is_err());
+    }
     #[test]
     fn processing_deadline_uses_the_request_operation_configuration() {
         let config = BackendConfig {
@@ -624,6 +1213,8 @@ mod tests {
             transcode_timeout_ms: 47,
             core003_enabled: true,
             core004_enabled: true,
+            video_transform_enabled: false,
+            mix_stems_enabled: false,
             max_output_bytes: 1024,
             ai_backend: None,
         };
@@ -671,7 +1262,8 @@ mod tests {
                     destination,
                     range: None,
                     profile: media_domain::TranscodeProfile::Standard,
-                    audio_selection: media_domain::AudioSelection::None
+                    audio_selection: media_domain::AudioSelection::None,
+                    video_transform: None,
                 }
             )
             .as_millis(),

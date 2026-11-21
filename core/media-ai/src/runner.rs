@@ -12,7 +12,7 @@ use std::{
     ffi::OsString,
     io::{self, Read},
     path::Path,
-    process::{Child, ChildStderr, ChildStdout, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -38,6 +38,14 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct RunOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// An exit status is exposed only after the child/group and both pipes have
+/// been confirmed reclaimed. Callers must validate their own fixed protocol.
+#[derive(Debug)]
+pub struct RunExitOutput {
+    pub output: RunOutput,
+    pub status: ExitStatus,
 }
 
 #[derive(Debug)]
@@ -310,6 +318,24 @@ pub fn run_group(
     cancel: &AtomicBool,
     output_limit: usize,
 ) -> Result<RunOutput, RunError> {
+    let value = run_group_with_status(program, args, timeout, cancel, output_limit)?;
+    if value.status.success() {
+        Ok(value.output)
+    } else {
+        Err(RunError::ProcessFailed)
+    }
+}
+
+/// As `run_group`, retaining the confirmed exit status for a fixed caller-owned
+/// native protocol. No status escapes before cancellation/cleanup checks.
+#[cfg(target_os = "macos")]
+pub fn run_group_with_status(
+    program: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    cancel: &AtomicBool,
+    output_limit: usize,
+) -> Result<RunExitOutput, RunError> {
     if QUARANTINED.load(Ordering::Acquire) {
         return Err(RunError::Quarantined);
     }
@@ -489,11 +515,10 @@ pub fn run_group(
                     _ => return Err(quarantine(guard.take())),
                 }
                 drop(guard.take());
-                return if status.success() {
-                    Ok(RunOutput { stdout, stderr })
-                } else {
-                    Err(RunError::ProcessFailed)
-                };
+                return Ok(RunExitOutput {
+                    output: RunOutput { stdout, stderr },
+                    status,
+                });
             }
             Ok(None) => (),
             Err(_) => return Err(terminate(guard, RunError::ProcessFailed)),
@@ -513,9 +538,45 @@ pub fn run_group(
     Err(RunError::UnsupportedPlatform)
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn run_group_with_status(
+    _program: &Path,
+    _args: &[OsString],
+    _timeout: Duration,
+    _cancel: &AtomicBool,
+    _output_limit: usize,
+) -> Result<RunExitOutput, RunError> {
+    Err(RunError::UnsupportedPlatform)
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_status_keeps_generic_runner_nonzero_rejection() {
+        let flag = AtomicBool::new(false);
+        let value = run_group_with_status(
+            Path::new("/usr/bin/false"),
+            &[],
+            Duration::from_secs(3),
+            &flag,
+            1024,
+        )
+        .expect("confirmed nonzero child");
+        assert!(!value.status.success());
+        assert_eq!(value.status.code(), Some(1));
+        assert!(matches!(
+            run_group(
+                Path::new("/usr/bin/false"),
+                &[],
+                Duration::from_secs(3),
+                &flag,
+                1024
+            ),
+            Err(RunError::ProcessFailed)
+        ));
+    }
 
     fn test_child() -> Process {
         let mut child = Command::new("/bin/sleep")

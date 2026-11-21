@@ -27,19 +27,32 @@ extension WorkspaceModel {
         assets[i].includedInBatch.toggle()
     }
     func queueDraft(asset: WorkspaceAsset) -> ExportDraft? {
-        guard asset.info != nil, let start = parseTimeText(asset.startText), let end = parseTimeText(asset.endText),
-              start < end else { return nil }
+        guard let info = asset.info, !info.isAudioOnly, info.streams.contains(where: { $0.codecType == "video" }),
+              let start = parseTimeText(asset.startText), let end = parseTimeText(asset.endText),
+              start >= 0, start < end, end <= info.durationUs,
+              (asset.videoTransform.isIdentity || (asset.mode == .transcodeStandard && connection?.capabilities.features["video_transform_v1"]?.available == true)) else { return nil }
         return ExportDraft(assetId: asset.id, sourceURL: asset.url, sourceName: asset.url.lastPathComponent,
             range: MediaRange(startUs: start, endUs: end), mode: asset.mode, configuration: backendConfiguration,
             audioSelection: asset.mode.transcodePreset == nil ? .all : asset.audioSelection,
-            expectedAudioIndices: asset.info?.streams.filter { $0.codecType == "audio" }.map(\.index))
+            expectedAudioIndices: asset.info?.streams.filter { $0.codecType == "audio" }.map(\.index),
+            videoTransform: asset.videoTransform.isIdentity ? nil : asset.videoTransform)
+    }
+    private func queueDraftIssue(_ asset: WorkspaceAsset) -> String {
+        let reason = !asset.videoTransform.isIdentity && asset.mode != .transcodeStandard
+            ? "画面变换需要标准有损转码；请切换模式或重置变换"
+            : !asset.videoTransform.isIdentity && connection?.capabilities.features["video_transform_v1"]?.available != true
+            ? "画面变换开发能力不可用"
+            : asset.info?.isAudioOnly == true
+            ? "纯音频仅供试听，不能提交视频剪辑或转码"
+            : (asset.failure ?? "尚未探测成功或区间无效")
+        return "\(asset.url.lastPathComponent)：\(reason)"
     }
     func submitBatch(assetIDs: [UUID], destinations: [URL]) async {
         guard assetIDs.count == destinations.count else { issue = "每份素材需要一个目标。"; return }
         saveSelectedEdits()
         let drafts = assetIDs.compactMap { id in assets.first(where: { $0.id == id }).flatMap(queueDraft) }
         guard drafts.count == assetIDs.count else {
-            issue = assetIDs.compactMap { id in assets.first(where: { $0.id == id }) }.filter { queueDraft(asset: $0) == nil }.map { "\($0.url.lastPathComponent)：\($0.failure ?? "尚未探测成功或区间无效")" }.joined(separator: "\n") + "\n本批未提交。"
+            issue = assetIDs.compactMap { id in assets.first(where: { $0.id == id }) }.filter { queueDraft(asset: $0) == nil }.map(queueDraftIssue).joined(separator: "\n") + "\n本批未提交。"
             return
         }
         await submitQueue(drafts: drafts, destinations: destinations)
@@ -47,7 +60,7 @@ extension WorkspaceModel {
     func queueRequest(_ value: ActiveExport) -> QueueMediaRequest {
         if let preset = value.draft.mode.transcodePreset {
             return .transcode(source: value.draft.sourceURL, destination: value.destinationURL,
-                range: value.draft.range, preset: preset, audio: value.draft.audioSelection)
+                range: value.draft.range, preset: preset, audio: value.draft.audioSelection, videoTransform: value.draft.videoTransform)
         }
         return .trim(source: value.draft.sourceURL, destination: value.destinationURL,
             range: value.draft.range, strategy: value.draft.mode)
@@ -55,20 +68,25 @@ extension WorkspaceModel {
     func releaseQueueLeases(_ id: UUID) {
         for lease in queueLeases.removeValue(forKey: id) ?? [] { release(lease) }
     }
-    func submitQueue(drafts: [ExportDraft], destinations: [URL]) async {
+    func submitQueue(drafts: [ExportDraft], destinations: [URL], authorizedFolder: URL? = nil, previewSpace: Bool = false) async {
         guard queueEnabled, !isSubmitting, pendingQueue == nil, !stopping, !unconfirmedCleanup,
               !drafts.isEmpty, drafts.count == destinations.count else { return }
+        guard drafts.allSatisfy({ $0.videoTransform == nil || ($0.mode == .transcodeStandard && connection?.capabilities.features["video_transform_v1"]?.available == true) }) else {
+            issue = "画面变换仅适用于支持该功能的标准有损转码，本批未提交。"; return
+        }
         let exports = zip(drafts, destinations).map { ActiveExport(id: UUID(), draft: $0.0, destinationURL: $0.1) }
         // Hold every source and output folder before the synchronous Core preflight.
         for item in exports {
-            queueLeases[item.id] = [hold(item.draft.sourceURL), hold(item.destinationURL.deletingLastPathComponent())]
+            queueLeases[item.id] = [hold(item.draft.sourceURL), hold(authorizedFolder ?? item.destinationURL.deletingLastPathComponent())]
         }
         pendingQueue = PendingQueueSubmission(token: UUID().uuidString, exports: exports, retryCoreID: nil)
+        pendingQueueNeedsConfirmation = previewSpace
         queueCancelRequested = false
-        await resolveQueueSubmission()
+        if previewSpace { await prepareStoragePreview() }
+        else { await resolveQueueSubmission() }
     }
     func resolveQueueSubmission() async {
-        guard let pending = pendingQueue, !isSubmitting, !stopping, !unconfirmedCleanup else { return }
+        guard let pending = pendingQueue, !pendingQueueNeedsConfirmation, !isSubmitting, !stopping, !unconfirmedCleanup else { return }
         isSubmitting = true; issue = nil; submissionErrors = []; closed = false
         status = "正在检查本批素材与目标；接收前不会创建排队任务。"
         defer { isSubmitting = false; isExporting = !queueLeases.isEmpty; updatePhase() }
@@ -121,7 +139,7 @@ extension WorkspaceModel {
                         sourceName: item.draft.sourceName, destinationName: item.destinationURL.lastPathComponent,
                         mode: item.draft.mode, requestedRange: item.draft.range, createdAt: Date(), coreJobId: coreID,
                         state: "queued", destinationBookmark: RecentTaskStore.bookmark(item.destinationURL),
-                        sessionId: queueSessionId, audioSelection: item.draft.audioSelection), at: 0)
+                        sessionId: queueSessionId, audioSelection: item.draft.audioSelection, videoTransform: item.draft.videoTransform), at: 0)
                 }
                 resultURLs[item.id] = item.destinationURL
             }
@@ -208,6 +226,7 @@ extension WorkspaceModel {
             default: expected = request.draft.expectedAudioIndices
             }
             matches = matches && expected != nil && actual == expected
+            matches = matches && result?.transcodePlan?.videoTransform == request.draft.videoTransform
         }
         if !matches, let index = tasks.firstIndex(where: { $0.id == taskID }) {
             tasks[index].state = "unconfirmed"; tasks[index].result = nil
@@ -249,16 +268,18 @@ extension WorkspaceModel {
         guard let index = order.firstIndex(of: id), order.indices.contains(index + offset) else { return }
         order.swapAt(index, index + offset); await reorderQueue(taskIDs: order)
     }
-    func retryTask(_ id: UUID, destination: URL) async {
+    func retryTask(_ id: UUID, destination: URL, authorizedFolder: URL? = nil, previewSpace: Bool = false) async {
         guard pendingQueue == nil, !isSubmitting, !stopping, !unconfirmedCleanup,
               let old = tasks.first(where: { $0.id == id && $0.sessionId == queueSessionId }),
               ["failed", "cancelled"].contains(old.state), let coreID = old.coreJobId,
               let request = queueRequests[id], assets.contains(where: { $0.id == request.draft.assetId }) else { issue = "这条记录不可重试。历史摘要需重新导入素材后手动提交。"; return }
         let new = ActiveExport(id: UUID(), draft: request.draft, destinationURL: destination)
-        queueLeases[new.id] = [hold(new.draft.sourceURL), hold(destination.deletingLastPathComponent())]
+        queueLeases[new.id] = [hold(new.draft.sourceURL), hold(authorizedFolder ?? destination.deletingLastPathComponent())]
         pendingQueue = PendingQueueSubmission(token: UUID().uuidString, exports: [new], retryCoreID: coreID)
+        pendingQueueNeedsConfirmation = previewSpace
         queueCancelRequested = false
-        await resolveQueueSubmission()
+        if previewSpace { await prepareStoragePreview() }
+        else { await resolveQueueSubmission() }
     }
     func clearQueueHistory() async {
         guard !isSubmitting, pendingQueue == nil, !stopping else { return }
@@ -269,38 +290,41 @@ extension WorkspaceModel {
             } catch { issue = error.localizedDescription; return }
         }
         let ids = Set(tasks.filter(\.terminal).map(\.id))
-        tasks.removeAll { ids.contains($0.id) }
+        let remaining = tasks.filter { !ids.contains($0.id) }
+        guard persistHistoryClear(remaining) else {
+            issue = "本机最近任务摘要未能清除，原记录仍保留；请检查存储后重试。"
+            status = "未确认清除本机最近任务。"; return
+        }
+        tasks = remaining
         for id in ids { queueRequests.removeValue(forKey: id); resultURLs.removeValue(forKey: id) }
-        persistTasks(); await refreshQueue(); status = "已清除已完成记录；运行与排队任务保留。"
+        await refreshQueue(); status = "已清除已完成记录；运行与排队任务保留。"
     }
     func chooseBatchOutput() {
-        guard canSubmitBatch else { return }
+        guard canSubmitBatch, !NativeFilePanels.hasPending else { return }
         saveSelectedEdits()
         let selected = assets.filter { $0.includedInBatch }
         let frozenDrafts = selected.compactMap(queueDraft)
-        guard frozenDrafts.count == selected.count else { issue = selected.filter { queueDraft(asset: $0) == nil }.map { "\($0.url.lastPathComponent)：\($0.failure ?? "尚未探测成功或区间无效")" }.joined(separator: "\n") + "\n本批未提交。"; return }
-        let panel = NSOpenPanel(); panel.title = "选择批量输出文件夹"; panel.canChooseFiles = false
+        guard frozenDrafts.count == selected.count else { issue = selected.filter { queueDraft(asset: $0) == nil }.map(queueDraftIssue).joined(separator: "\n") + "\n本批未提交。"; return }
+        guard let panel = NativeFilePanels.open() else { return }; panel.title = "选择批量输出文件夹"; panel.canChooseFiles = false
         panel.canChooseDirectories = true; panel.canCreateDirectories = true
         panel.message = "每项使用新的独立 MP4 文件名；已有文件不会替换。"
-        panel.begin { [weak self] response in
-            guard response == .OK, let folder = panel.url else { return }
+        NativeFilePanels.begin(panel) { [weak self] selection in
+            guard selection.response == .OK, let folder = selection.url else { return }
             Task { @MainActor in
                 guard let self else { return }
                 let destinations = selected.enumerated().map { index, item in
                     folder.appendingPathComponent(item.url.deletingPathExtension().lastPathComponent + "-导出-\(index + 1)-\(UUID().uuidString.prefix(8)).mp4")
                 }
-                await self.submitQueue(drafts: frozenDrafts, destinations: destinations)
+                await self.submitQueue(drafts: frozenDrafts, destinations: destinations, authorizedFolder: folder, previewSpace: true)
             }
         }
     }
     func chooseRetryOutput(_ id: UUID) {
-        guard let item = tasks.first(where: { $0.id == id }) else { return }
-        let panel = NSSavePanel(); panel.title = "重试并保存为新文件"; panel.allowedContentTypes = [.mpeg4Movie]
-        panel.nameFieldStringValue = URL(fileURLWithPath: item.destinationName).deletingPathExtension().lastPathComponent + "-重试-\(UUID().uuidString.prefix(8)).mp4"
-        panel.message = "Core 会保留原请求设置并重新检查源文件；原目标和已有文件不会替换。"
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in await self?.retryTask(id, destination: url) }
+        guard !stopping, !unconfirmedCleanup, !isSubmitting, pendingQueue == nil,
+              let item = tasks.first(where: { $0.id == id }) else { return }
+        let name = URL(fileURLWithPath: item.destinationName).deletingPathExtension().lastPathComponent + "-重试-\(UUID().uuidString.prefix(8)).mp4"
+        chooseAuthorizedOutput(title: "重试并保存为新文件", name: name) { [weak self] url, folder in
+            await self?.retryTask(id, destination: url, authorizedFolder: folder, previewSpace: true)
         }
     }
 }

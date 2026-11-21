@@ -77,6 +77,8 @@ struct WorkspaceStepEvidence: Encodable, Sendable {
     let submissionErrors: [QueueRejection]
     let submitting: Bool
     let pendingSubmissionToken: String?
+    let storagePreview: StoragePreviewResponse?
+    let awaitingStorageConfirmation: Bool
 }
 struct WorkspaceSelfTestReport: Encodable, Sendable {
     let schemaVersion = 1
@@ -88,6 +90,7 @@ struct WorkspaceSelfTestReport: Encodable, Sendable {
     let bridgeDiagnostics: BridgeDiagnostics
     let accessDiagnostics: AccessDiagnostics
     let closed: Bool
+    let expectedCleanupFailure: Bool
 }
 @MainActor
 private func workspaceEvidence(_ model: WorkspaceModel, action: String, cachedDiagnostics: Bool = false, actionWallTimeMs: Double? = nil) async -> WorkspaceStepEvidence {
@@ -103,7 +106,8 @@ private func workspaceEvidence(_ model: WorkspaceModel, action: String, cachedDi
             actualRange: task.actualRange, error: task.failure, result: task.result, interrupted: task.interrupted, audioSelection: task.audioSelection, sessionId: task.sessionId)
     }, core: model.snapshot, trace: model.trace, preview: model.preview.diagnostics, bridgeDiagnostics: bridgeDiagnostics,
        accessDiagnostics: model.accessDiagnostics, error: model.issue, closed: model.closed,
-       shutdownDiagnostics: model.shutdownDiagnostics, actionWallTimeMs: actionWallTimeMs, canImport: model.canImport, canExport: model.canExport, queue: model.queueSnapshot, submissionErrors: model.submissionErrors, submitting: model.isSubmitting, pendingSubmissionToken: model.pendingQueue?.token)
+       shutdownDiagnostics: model.shutdownDiagnostics, actionWallTimeMs: actionWallTimeMs, canImport: model.canImport, canExport: model.canExport, queue: model.queueSnapshot, submissionErrors: model.submissionErrors, submitting: model.isSubmitting, pendingSubmissionToken: model.pendingQueue?.token,
+       storagePreview: model.storagePreview?.response, awaitingStorageConfirmation: model.pendingQueueNeedsConfirmation)
 }
 @MainActor
 func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
@@ -140,6 +144,7 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
     var steps: [WorkspaceStepEvidence] = []
     var totalBridge = BridgeDiagnostics()
     var totalAccess = AccessDiagnostics()
+    var expectedCleanupFailure = false
     func absoluteURL(_ path: String?) throws -> URL {
         guard let path, path.hasPrefix("/") else { throw CheckFailure(message: "Action requires an absolute file path") }
         return URL(fileURLWithPath: path)
@@ -150,6 +155,7 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
     }
     do {
         for action in scenario.actions {
+            let actionStarted = ContinuousClock.now
             var useCachedDiagnostics = false
             var actionWallTimeMs: Double?
             switch action.action {
@@ -192,6 +198,15 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                 case "one": guard let index = action.streamIndex else { throw CheckFailure(message: "one requires stream_index") }; model.audioSelection = .one(index: index)
                 default: throw CheckFailure(message: "Unknown audio choice")
                 }
+            case "storage-preview":
+                guard let indices = action.indices, let paths = action.destinations,
+                      indices.allSatisfy({ model.assets.indices.contains($0) }) else { throw CheckFailure(message: "storage-preview indices invalid") }
+                model.saveSelectedEdits()
+                let drafts = indices.compactMap { model.queueDraft(asset: model.assets[$0]) }
+                guard drafts.count == indices.count else { throw CheckFailure(message: "storage-preview drafts invalid") }
+                await model.submitQueue(drafts: drafts, destinations: try paths.map { try absoluteURL($0) }, previewSpace: true)
+            case "storage-confirm": await model.confirmStoragePreview()
+            case "storage-cancel": model.cancelStoragePreview()
             case "batch":
                 guard let indices = action.indices, let paths = action.destinations,
                       indices.allSatisfy({ model.assets.indices.contains($0) }) else { throw CheckFailure(message: "batch indices invalid") }
@@ -232,7 +247,9 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                     var finished = false
                     pendingExport = Task { await current.export(to: url); finished = true }
                     let deadline = ContinuousClock.now + .seconds(20)
-                    while current.activeExport?.coreJobId == nil && !finished && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                    while current.activeExport?.coreJobId == nil
+                        && !(current.queueEnabled && current.tasks.contains(where: { !$0.terminal && $0.sessionId == current.queueSessionId }))
+                        && !finished && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
                 } else { await model.export(to: url) }
             case "wait":
                 if model.queueEnabled { await model.awaitQueue() }
@@ -240,6 +257,11 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                 if model.queueEnabled { await model.awaitQueue() }
                 for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
             case "cancel": await model.cancel()
+            case "cancel-and-wait":
+                await model.cancel()
+                if model.queueEnabled { await model.awaitQueue() }
+                await pendingExport?.value; pendingExport = nil
+                await pendingImport?.value; pendingImport = nil
             case "clear-history": if model.queueEnabled { await model.clearQueueHistory() } else { model.clearHistory() }
             case "play": model.preview.togglePlayback(); try await Task.sleep(for: .milliseconds(min(5000, max(0, action.milliseconds ?? 150)))); model.preview.pause()
             case "seek": try await model.preview.seek(normalizedUs: action.positionUs ?? 0)
@@ -271,6 +293,20 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                 let elapsed = started.duration(to: .now).components
                 actionWallTimeMs = Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1_000_000_000_000_000
                 useCachedDiagnostics = true
+            case "shutdown-expect-cleanup-failure":
+                do {
+                    try await model.shutdown()
+                    throw CheckFailure(message: "Expected cleanup failure was not observed")
+                } catch {
+                    guard model.unconfirmedCleanup, !model.closed,
+                          model.shutdownDiagnostics.cleanupFailed,
+                          model.accessDiagnostics.heldLeases > 0,
+                          !model.canImport, !model.canExport else { throw error }
+                }
+                // Fault-only terminal observation: the live quarantined owner and
+                // authorization intentionally remain held until this test process
+                // exits. This is not a successful application close.
+                expectedCleanupFailure = true
             case "restart", "shutdown", "await-shutdown":
                 try await model.shutdown(); await pendingExport?.value; pendingExport = nil; await pendingImport?.value; pendingImport = nil
                 for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
@@ -281,12 +317,17 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
                 }
             default: throw CheckFailure(message: "Unknown scenario action \(action.action)")
             }
+            if actionWallTimeMs == nil {
+                let elapsed = actionStarted.duration(to: .now).components
+                actionWallTimeMs = Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1_000_000_000_000_000
+            }
             steps.append(await workspaceEvidence(model, action: action.action, cachedDiagnostics: useCachedDiagnostics, actionWallTimeMs: actionWallTimeMs))
+            if expectedCleanupFailure { break }
         }
-        if !model.closed { try await model.shutdown() }
+        if !model.closed && !expectedCleanupFailure { try await model.shutdown() }
         await pendingExport?.value; await pendingImport?.value
         for selection in pendingSelections { await selection.value }; pendingSelections.removeAll()
-        steps.append(await workspaceEvidence(model, action: "final-shutdown"))
+        steps.append(await workspaceEvidence(model, action: expectedCleanupFailure ? "expected-cleanup-failure-retained" : "final-shutdown"))
         totalBridge.accumulate(await model.diagnostics()); aggregate(model.accessDiagnostics)
     } catch {
         try? await model.shutdown(); await pendingExport?.value; await pendingImport?.value
@@ -294,8 +335,11 @@ func runWorkspaceSelfTest() async throws -> WorkspaceSelfTestReport {
         heartbeat.cancel(); await heartbeat.value; throw error
     }
     heartbeat.cancel(); await heartbeat.value
-    let passed = model.closed && totalBridge.allCallsOffMainThread && totalBridge.outputCalls == totalBridge.bufferReleaseCalls
-        && totalAccess.activeGranted == 0 && totalAccess.heldLeases == 0 && totalAccess.granted == totalAccess.stops
+    let ownershipConfirmed = expectedCleanupFailure
+        ? !model.closed && model.unconfirmedCleanup && totalAccess.heldLeases > 0 && !model.canImport && !model.canExport
+        : model.closed && totalAccess.activeGranted == 0 && totalAccess.heldLeases == 0 && totalAccess.granted == totalAccess.stops
+    let passed = ownershipConfirmed && totalBridge.allCallsOffMainThread && totalBridge.outputCalls == totalBridge.bufferReleaseCalls
     return WorkspaceSelfTestReport(passed: passed, steps: steps, heartbeatCount: heartbeatCount, heartbeatMaxIntervalMs: maxInterval,
-                                  bridgeDiagnostics: totalBridge, accessDiagnostics: totalAccess, closed: model.closed)
+                                  bridgeDiagnostics: totalBridge, accessDiagnostics: totalAccess, closed: model.closed,
+                                  expectedCleanupFailure: expectedCleanupFailure)
 }

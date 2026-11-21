@@ -14,6 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         transcode_timeout_ms: 600000,
         core003_enabled: true,
         core004_enabled: true,
+        video_transform_enabled: false,
+        mix_stems_enabled: false,
         max_output_bytes: 16 * 1024 * 1024,
         ai_backend: None,
     };
@@ -40,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stream_index: n.parse()?,
             },
         },
+        video_transform: None,
     };
     let result = media_ffmpeg::execute(&config, &req, &AtomicBool::new(false));
     match result {

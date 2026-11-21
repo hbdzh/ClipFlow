@@ -1,0 +1,131 @@
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1519,6 +1519,7 @@
+     int encoding_contexts_entered = 0;
+     int lookahead_initialized = 0;
+     int ratecontrol_initialized = 0;
++    int opencl_context_attempted = 0;
+     enum
+     {
+         OPEN_MUTEX = 1, OPEN_CV = 2, OPEN_FDEC = 4,
+@@ -1840,7 +1841,7 @@
+     }
+ 
+ #if HAVE_OPENCL
+-    if( h->param.b_opencl && x264_opencl_lookahead_init( h ) < 0 )
++    if( h->param.b_opencl && x264_opencl_lookahead_init( h, &opencl_context_attempted ) < 0 )
+         h->param.b_opencl = 0;
+ #endif
+ 
+@@ -1907,11 +1908,12 @@
+     if( h != NULL )
+     {
+         /* No encoder has been published and no frames/jobs have been submitted.
+-         * OpenCL owns additional platform state and keeps its prior bounded
++         * Only a context creation attempt can install asynchronous callbacks;
++         * OpenCL compilation alone is safe. Keep platform state in its bounded
+          * cleanup until that lifecycle has a separately reviewed abort. */
+-        if( !shared_contexts_started || !HAVE_OPENCL )
+-        {
+-            if( !HAVE_OPENCL && lookahead_initialized )
++        if( !shared_contexts_started || !opencl_context_attempted )
++        {
++            if( !opencl_context_attempted && lookahead_initialized )
+             {
+                 /* Complete empty queues; stop/join before borrowed data dies. */
+                 x264_lookahead_delete( h );
+@@ -1923,10 +1925,9 @@
+                 x264_threadpool_delete( h->lookaheadpool );
+             if( threadpool_initialized )
+                 x264_threadpool_delete( h->threadpool );
+-            if( !HAVE_OPENCL )
+-            {
+-                /* No-commit RC abort supports no-stats/no-zones only. Other RC
+-                 * modes retain their explicit technical cleanup gap. */
++            if( !opencl_context_attempted )
++            {
++                /* Respect the no-publish RC abort private/caller ownership contract. */
+                 if( ratecontrol_initialized )
+                     x264_ratecontrol_abort_open( h );
+                 /* Counts, not unvalidated input thread limits, bound rollback. */
+@@ -1964,6 +1965,11 @@
+             x264_free( h->reconfig_h );
+             if( cqm_initialized )
+                 x264_cqm_delete( h );
++#if HAVE_OPENCL
++            /* Frames may borrow this table; close after their delete. */
++            x264_opencl_close_library( h->opencl.ocl );
++            h->opencl.ocl = NULL;
++#endif
+         }
+         x264_param_cleanup( &h->param );
+     }
+--- a/common/opencl.c
++++ b/common/opencl.c
+@@ -73,6 +73,7 @@
+     LOAD_OCL_FUNC( clCreateProgramWithSource, 0 );
+     LOAD_OCL_FUNC( clEnqueueCopyBuffer, 0 );
+     LOAD_OCL_FUNC( clEnqueueMapBuffer, 0 );
++    LOAD_OCL_FUNC( clEnqueueUnmapMemObject, 0 );
+     LOAD_OCL_FUNC( clEnqueueNDRangeKernel, 0 );
+     LOAD_OCL_FUNC( clEnqueueReadBuffer, 0 );
+     LOAD_OCL_FUNC( clEnqueueWriteBuffer, 0 );
+@@ -408,7 +409,7 @@
+     x264_log( h, X264_LOG_ERROR, "OpenCL: fatal error, aborting encode\n" );
+ }
+ 
+-int x264_opencl_lookahead_init( x264_t *h )
++int x264_opencl_lookahead_init( x264_t *h, int *context_attempted )
+ {
+     x264_opencl_function_t *ocl = h->opencl.ocl;
+     cl_platform_id *platforms = NULL;
+@@ -473,6 +474,8 @@
+ 
+             if( context )
+                 ocl->clReleaseContext( context );
++            /* Creation may notify even when it returns an error. */
++            *context_attempted = 1;
+             context = ocl->clCreateContext( NULL, 1, &h->opencl.device, (void*)opencl_error_notify, (void*)h, &status );
+             if( status != CL_SUCCESS || !context )
+                 continue;
+@@ -601,7 +604,20 @@
+         return;
+ 
+     if( h->opencl.queue )
++    {
++        if( h->opencl.page_locked_ptr && h->opencl.page_locked_buffer )
++        {
++            cl_int status = ocl->clEnqueueUnmapMemObject( h->opencl.queue,
++                h->opencl.page_locked_buffer, h->opencl.page_locked_ptr, 0, NULL, NULL );
++            if( status == CL_SUCCESS )
++                h->opencl.page_locked_ptr = NULL;
++            else
++                x264_log( h, X264_LOG_WARNING, "OpenCL: unable to unmap page-locked buffer (%d)\n", status );
++        }
++        /* In-order queue: finish pending uses and unmap before release.
++         * Driver error recovery retains the prior best-effort boundary. */
+         ocl->clFinish( h->opencl.queue );
++    }
+ 
+     opencl_lookahead_free( h );
+ 
+--- a/common/opencl.h
++++ b/common/opencl.h
+@@ -688,6 +688,7 @@
+     OCL_DECLARE_FUNC( clCreateProgramWithSource );
+     OCL_DECLARE_FUNC( clEnqueueCopyBuffer );
+     OCL_DECLARE_FUNC( clEnqueueMapBuffer );
++    OCL_DECLARE_FUNC( clEnqueueUnmapMemObject );
+     OCL_DECLARE_FUNC( clEnqueueNDRangeKernel );
+     OCL_DECLARE_FUNC( clEnqueueReadBuffer );
+     OCL_DECLARE_FUNC( clEnqueueWriteBuffer );
+@@ -799,7 +800,8 @@
+ void x264_opencl_close_library( x264_opencl_function_t *ocl );
+ 
+ #define x264_opencl_lookahead_init x264_template(opencl_lookahead_init)
+-int x264_opencl_lookahead_init( x264_t *h );
++/* Caller starts flag at0; set before any context creation/callback attempt. */
++int x264_opencl_lookahead_init( x264_t *h, int *context_attempted );
+ #define x264_opencl_lookahead_delete x264_template(opencl_lookahead_delete)
+ void x264_opencl_lookahead_delete( x264_t *h );
+ 

@@ -41,6 +41,27 @@ pub(crate) fn integer(value: &Value) -> Result<i64, MediaError> {
         .ok_or_else(invalid)
 }
 
+/// MOV may omit an unspecified language that MP4 writes explicitly as `und`.
+/// A known language must still match exactly; absence never matches `eng` etc.
+pub(crate) fn language(value: &Value) -> Option<&str> {
+    value.as_str().filter(|s| !s.is_empty() && *s != "und")
+}
+
+pub(crate) fn verified_cfr_rate(media: &Media) -> Option<String> {
+    let rate = crate::scope::rate(media).ok()?;
+    crate::scope::validate_cfr(
+        &media
+            .frames
+            .iter()
+            .map(|f| (f.pts, f.duration))
+            .collect::<Vec<_>>(),
+        media.time_base,
+        rate,
+    )
+    .ok()?;
+    Some(format!("{}/{}", rate.numerator, rate.denominator))
+}
+
 fn probe_json(context: &Context<'_>, path: &Path, options: &[&str]) -> Result<Value, MediaError> {
     let mut command = args(&[
         "-v",
@@ -73,6 +94,7 @@ fn probe_json(context: &Context<'_>, path: &Path, options: &[&str]) -> Result<Va
 }
 
 pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, MediaError> {
+    crate::references::reject_external(path)?;
     let raw = probe_json(context, path, &["-show_format", "-show_streams"])?;
     let raw_streams = raw["streams"].as_array().ok_or_else(invalid)?;
     if raw_streams.is_empty() {
@@ -147,7 +169,8 @@ pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, Media
     // Rotation/display matrices and explicitly signalled colour/HDR metadata
     // need their own golden output acceptance. Probe reports them, but this
     // bounded trim adapter must not silently discard or reinterpret them.
-    let trim_display_metadata_supported = video["tags"].get("rotate").is_none()
+    let trim_display_metadata_supported = crate::references::simple_edits(path)?
+        && video["tags"].get("rotate").is_none()
         && video["side_data_list"]
             .as_array()
             .is_none_or(|data| data.is_empty())
@@ -183,7 +206,8 @@ pub(crate) fn inspect(context: &Context<'_>, path: &Path) -> Result<Media, Media
         && video["color_space"] == "bt709"
         && video["color_transfer"] == "bt709"
         && video["color_primaries"] == "bt709";
-    let core003_display_metadata_supported = no_display_side_data && (no_colour || bt709);
+    let core003_display_metadata_supported =
+        no_display_side_data && (no_colour || bt709) && crate::references::simple_edits(path)?;
     let video_index = integer(&video["index"])?;
     let time_base = Rational::parse(video["time_base"].as_str().ok_or_else(invalid)?)?;
     let raw_frames = probe_json(
@@ -583,6 +607,25 @@ pub(crate) fn full_decode(context: &Context<'_>, path: &Path) -> Result<(), Medi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn absent_mov_language_equals_only_unspecified_mp4_language() {
+        assert_eq!(
+            super::language(&serde_json::Value::Null),
+            super::language(&serde_json::json!("und"))
+        );
+        assert_ne!(
+            super::language(&serde_json::Value::Null),
+            super::language(&serde_json::json!("eng"))
+        );
+        assert_ne!(
+            super::language(&serde_json::json!("eng")),
+            super::language(&serde_json::json!("zho"))
+        );
+        assert_eq!(
+            super::language(&serde_json::json!("eng")),
+            super::language(&serde_json::json!("eng"))
+        );
+    }
     use super::*;
 
     #[test]

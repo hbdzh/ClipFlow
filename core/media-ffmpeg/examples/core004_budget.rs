@@ -21,6 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         transcode_timeout_ms: args[7].parse()?,
         core003_enabled: true,
         core004_enabled: true,
+        video_transform_enabled: false,
+        mix_stems_enabled: false,
         max_output_bytes: 16 * 1024 * 1024,
         ai_backend: None,
     };
@@ -59,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             range: Some(range),
             profile: TranscodeProfile::Standard,
             audio_selection: AudioSelection::None,
+            video_transform: None,
         },
         _ => return Err("unknown operation".into()),
     };

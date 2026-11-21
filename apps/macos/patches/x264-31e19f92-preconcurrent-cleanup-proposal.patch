@@ -1,0 +1,74 @@
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1509,6 +1509,9 @@
+     x264_t *h;
+     char buf[1000], *p;
+     int i_slicetype_length;
++    int cqm_initialized = 0;
++    int costs_started = 0;
++    int concurrent_resources_started = 0;
+ 
+     CHECKED_MALLOCZERO( h, sizeof(x264_t) );
+ 
+@@ -1586,6 +1589,7 @@
+ 
+     if( x264_cqm_init( h ) < 0 )
+         goto fail;
++    cqm_initialized = 1;
+ 
+     h->mb.i_mb_width = h->sps->i_mb_width;
+     h->mb.i_mb_height = h->sps->i_mb_height;
+@@ -1705,6 +1709,7 @@
+         p += sprintf( p, " none!" );
+     x264_log( h, X264_LOG_INFO, "%s\n", buf );
+ 
++    costs_started = 1;
+     if( x264_analyse_init_costs( h ) )
+         goto fail;
+ 
+@@ -1734,6 +1739,8 @@
+ 
+     CHECKED_MALLOC( h->reconfig_h, sizeof(x264_t) );
+ 
++    /* Later initialization can introduce concurrent/shared owners. */
++    concurrent_resources_started = 1;
+     if( h->param.i_threads > 1 &&
+         x264_threadpool_init( &h->threadpool, h->param.i_threads ) )
+         goto fail;
+@@ -1855,7 +1862,25 @@
+     return h;
+ fail:
+     if( h != NULL )
++    {
++        /* Only the exclusively owned pre-concurrent prefix is safe here.
++         * Late partial initialization needs constructor-safe teardown. */
++        if( !concurrent_resources_started )
++        {
++            if( costs_started )
++                x264_analyse_free_costs( h );
++            x264_free( h->cost_table );
++            x264_free( h->frames.unused[0] );
++            x264_free( h->frames.unused[1] );
++            x264_free( h->frames.current );
++            x264_free( h->frames.blank_unused );
++            x264_free( h->nal_buffer );
++            x264_free( h->reconfig_h );
++            if( cqm_initialized )
++                x264_cqm_delete( h );
++        }
+         x264_param_cleanup( &h->param );
++    }
+     x264_free( h );
+     return NULL;
+ }
+--- a/common/set.c
++++ b/common/set.c
+@@ -265,7 +265,7 @@
+         if( h->param.rc.i_qp_min > h->param.rc.i_qp_max )
+         {
+             x264_log( h, X264_LOG_ERROR, "Impossible QP constraints for CQM (min=%d, max=%d)\n", h->param.rc.i_qp_min, h->param.rc.i_qp_max );
+-            return -1;
++            goto fail;
+         }
+     }
+     return 0;

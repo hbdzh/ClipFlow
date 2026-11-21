@@ -11,6 +11,7 @@ struct WorkspaceAsset: Identifiable, Sendable {
     var endText = "0.000000"
     var mode: ExportStrategy
     var audioSelection: AudioSelection = .all
+    var videoTransform: VideoTransform = .identity
     var includedInBatch = true
 }
 struct ExportDraft: Codable, Sendable {
@@ -22,6 +23,7 @@ struct ExportDraft: Codable, Sendable {
     let configuration: BackendConfiguration
     var audioSelection: AudioSelection = .all
     var expectedAudioIndices: [Int]?
+    var videoTransform: VideoTransform?
 }
 struct ActiveExport: Codable, Sendable {
     let id: UUID
@@ -46,6 +48,7 @@ struct WorkspaceTask: Identifiable, Codable, Sendable {
     var interrupted = false
     var sessionId: UUID?
     var audioSelection: AudioSelection?
+    var videoTransform: VideoTransform?
 
     // Persistence excludes the native handle, whole Core response and raw paths.
     func summary() -> WorkspaceTask {
@@ -61,8 +64,13 @@ final class RecentTaskStore {
     private let path: URL?
     private let defaults: UserDefaults
     private let key = "MediaStudio.mac002.recentTasks.v1"
-    init(path: URL? = nil, defaults: UserDefaults = .standard) { self.path = path; self.defaults = defaults }
+    let sharedLedger: RecentTaskLedger?
+    init(path: URL? = nil, defaults: UserDefaults = .standard, ledger: RecentTaskLedger? = nil) {
+        self.path = path; self.defaults = defaults
+        sharedLedger = ledger ?? (path == nil && defaults === UserDefaults.standard ? RecentTaskLedger.shared : nil)
+    }
     func load() -> [WorkspaceTask] {
+        if let sharedLedger { return sharedLedger.videoTasks }
         let data: Data?
         if let path {
             let values = try? path.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
@@ -80,6 +88,7 @@ final class RecentTaskStore {
         }
     }
     func save(_ tasks: [WorkspaceTask]) throws {
+        if let sharedLedger { try sharedLedger.saveVideos(tasks); return }
         let values = tasks.prefix(100).map { $0.summary() }
         let data = try JSONEncoder().encode(values)
         guard data.count <= 2_000_000 else { throw CheckFailure(message: "最近任务摘要超出保存上限。") }
@@ -94,15 +103,26 @@ final class RecentTaskStore {
             try data.write(to: path, options: .atomic)
         } else { defaults.set(data, forKey: key) }
     }
+    func clearTerminated(keepingVideos values: [WorkspaceTask]) throws {
+        if let sharedLedger { try sharedLedger.clearTerminated(keepingVideos: values) }
+        else { try save(values) }
+    }
     static func bookmark(_ url: URL) -> Data? {
-        (try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil))
+        NativeHeartbeat.shared.measure(.destinationBookmark) {
+            (try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil))
             ?? (try? url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil))
+        }
     }
     static func resolve(_ data: Data?) -> URL? {
         guard let data else { return nil }
-        var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: [.withoutUI, .withSecurityScope],
-                                 relativeTo: nil, bookmarkDataIsStale: &stale), !stale else { return nil }
-        return url
+        // Minimal bookmarks are used when scope creation is unavailable (for
+        // example a local non-sandbox development host). Resolution never adds
+        // permission: callers still hold scope and verify current readability.
+        for options: URL.BookmarkResolutionOptions in [[.withoutUI, .withSecurityScope], [.withoutUI]] {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: data, options: options,
+                                   relativeTo: nil, bookmarkDataIsStale: &stale), !stale { return url }
+        }
+        return nil
     }
 }

@@ -6,6 +6,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+fn source_error(error: &std::io::Error, message: &'static str) -> MediaError {
+    MediaError::new(
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            "PERMISSION_DENIED"
+        } else {
+            "INVALID_INPUT"
+        },
+        message,
+    )
+}
+
+pub(crate) fn open_regular_read(path: &Path) -> Result<fs::File, MediaError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Darwin <sys/fcntl.h>: O_NONBLOCK = 0x0004. This backend accepts only
+        // macOS. A path replaced by a FIFO must not block Core before timeout
+        // handling can run; O_NONBLOCK has no effect on ordinary file reads.
+        options.custom_flags(0x0004);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| source_error(&error, "Source file cannot be read."))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| source_error(&error, "Source metadata cannot be read."))?;
+    if !metadata.is_file() {
+        return Err(MediaError::new(
+            "INVALID_INPUT",
+            "Source must be a regular file.",
+        ));
+    }
+    Ok(file)
+}
+
 fn creation_error(error: &std::io::Error, message: &'static str) -> MediaError {
     // Accepted backend is macOS, where ENOSPC is 28. Unknown platforms retain
     // the conservative fallback rather than claiming portable errno semantics.
@@ -32,15 +69,18 @@ impl Source {
         }
         let path = path
             .canonicalize()
-            .map_err(|_| MediaError::new("INVALID_INPUT", "Source file cannot be opened."))?;
+            .map_err(|error| source_error(&error, "Source file cannot be opened."))?;
         let metadata = fs::metadata(&path)
-            .map_err(|_| MediaError::new("INVALID_INPUT", "Source metadata cannot be read."))?;
+            .map_err(|error| source_error(&error, "Source metadata cannot be read."))?;
         if !metadata.is_file() || metadata.len() == 0 {
             return Err(MediaError::new(
                 "INVALID_INPUT",
                 "Source must be a nonempty regular file.",
             ));
         }
+        // Metadata access alone does not establish read access. Detect an
+        // inaccessible source before ffprobe's nonzero exit obscures EACCES.
+        let _read_access = open_regular_read(&path)?;
         Ok(Self { path, metadata })
     }
 
@@ -75,10 +115,22 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
 }
 
 pub(crate) fn destination(source: &Source, path: &Path) -> Result<PathBuf, MediaError> {
-    if !path.is_absolute() || path.extension().and_then(|s| s.to_str()) != Some("mp4") {
+    destination_with_extension(source, path, "mp4")
+}
+
+pub(crate) fn wav_destination(source: &Source, path: &Path) -> Result<PathBuf, MediaError> {
+    destination_with_extension(source, path, "wav")
+}
+
+fn destination_with_extension(
+    source: &Source,
+    path: &Path,
+    extension: &str,
+) -> Result<PathBuf, MediaError> {
+    if !path.is_absolute() || path.extension().and_then(|s| s.to_str()) != Some(extension) {
         return Err(MediaError::new(
             "INVALID_INPUT",
-            "Destination must be a new absolute MP4 file.",
+            "Destination must be a new absolute file of the selected output format.",
         ));
     }
     match fs::symlink_metadata(path) {

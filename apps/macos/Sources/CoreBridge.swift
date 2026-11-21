@@ -40,12 +40,16 @@ struct MediaStream: Codable, Sendable {
 }
 struct MediaInfo: Codable, Sendable {
     let container: String
-    let videoOriginUs: Int64
+    let videoOriginUs: Int64?
+    let mediaKind: String?
+    let audioOriginUs: Int64?
+    let videoCfrRate: String?
     let durationUs: Int64
     let videoFrameCount: Int?
     let trimDisplayMetadataSupported: Bool?
     let core003DisplayMetadataSupported: Bool?
     let streams: [MediaStream]
+    var isAudioOnly: Bool { mediaKind == "audio" && !streams.contains(where: { $0.codecType == "video" }) }
 }
 struct MediaRange: Codable, Sendable {
     let startUs: Int64
@@ -162,6 +166,13 @@ struct OutputValidation: Codable, Sendable {
             && (strategy != .streamCopyV1 || core003ScopeVerified == true)
     }
 }
+struct AudioPreviewValidation: Codable, Sendable {
+    let sourceIdentityUnchanged: Bool
+    let fullDecode: Bool
+    let finiteSamples: Bool
+    let contentMappingVerified: Bool
+    var verified: Bool { sourceIdentityUnchanged && fullDecode && finiteSamples && contentMappingVerified }
+}
 struct JobResult: Codable, Sendable {
     let mockOnly: Bool
     let fileCreated: Bool
@@ -177,8 +188,15 @@ struct JobResult: Codable, Sendable {
     let lossless: Bool?
     let accuratePlan: AccuratePlan?
     let transcodePlan: TranscodePlan?
+    let previewOnly: Bool?
+    let sampleRate: Int?
+    let channels: Int?
+    let sampleCount: Int64?
+    let sourceAudioOriginUs: Int64?
+    let sourceContentDurationUs: Int64?
+    let previewValidation: AudioPreviewValidation?
     var exportStrategy: ExportStrategy? {
-        guard fileCreated else { return nil }
+        guard fileCreated, previewOnly != true else { return nil }
         if strategy == nil && profile == nil { return .legacyStreamCopy }
         if strategy == "stream_copy", profile == "mp4_h264_copy_v1" { return .streamCopyV1 }
         if strategy == "accurate_reencode", profile == "mp4_h264_standard_v1" { return .accurateReencode }
@@ -189,6 +207,7 @@ struct JobResult: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case mockOnly, fileCreated, mediaInfo, requestedRangeUs, actualRangeUs, actualSourceRangeUs
         case outputMediaInfo, validation, strategy, profile, reencoded, lossless, accuratePlan, transcodePlan
+        case previewOnly, sampleRate, channels, sampleCount, sourceAudioOriginUs, sourceContentDurationUs, previewValidation
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -206,6 +225,25 @@ struct JobResult: Codable, Sendable {
         lossless = try c.decodeIfPresent(Bool.self, forKey: .lossless)
         accuratePlan = try c.decodeIfPresent(AccuratePlan.self, forKey: .accuratePlan)
         transcodePlan = try c.decodeIfPresent(TranscodePlan.self, forKey: .transcodePlan)
+        previewOnly = try c.decodeIfPresent(Bool.self, forKey: .previewOnly)
+        sampleRate = try c.decodeIfPresent(Int.self, forKey: .sampleRate)
+        channels = try c.decodeIfPresent(Int.self, forKey: .channels)
+        sampleCount = try c.decodeIfPresent(Int64.self, forKey: .sampleCount)
+        sourceAudioOriginUs = try c.decodeIfPresent(Int64.self, forKey: .sourceAudioOriginUs)
+        sourceContentDurationUs = try c.decodeIfPresent(Int64.self, forKey: .sourceContentDurationUs)
+        previewValidation = try c.decodeIfPresent(AudioPreviewValidation.self, forKey: .previewValidation)
+        if previewOnly == true {
+            guard !mockOnly, fileCreated, profile == "wav_pcm_f32_preview_v1", strategy == nil,
+                  let sampleRate, [44100, 48000].contains(sampleRate), let channels, [1, 2].contains(channels),
+                  let sampleCount, sampleCount > 0, sampleCount <= Int64(sampleRate) * 600,
+                  sourceAudioOriginUs != nil, let sourceContentDurationUs, sourceContentDurationUs > 0,
+                  sourceContentDurationUs <= 600_000_000,
+                  (sampleCount * 1_000_000 / Int64(sampleRate) - sourceContentDurationUs).magnitude <= 1,
+                  previewValidation?.verified == true else {
+                throw DecodingError.dataCorruptedError(forKey: .previewValidation, in: c, debugDescription: "Unverified private audio preview result.")
+            }
+            return
+        }
         if fileCreated {
             guard !mockOnly, requestedRangeUs != nil, actualRangeUs != nil,
                   actualSourceRangeUs != nil, outputMediaInfo != nil,
@@ -219,6 +257,14 @@ struct JobResult: Codable, Sendable {
         }
     }
 }
+struct AIBackendConfiguration: Codable, Equatable, Sendable {
+    let nativeWorker: String
+    let nativeGraphs: String
+    let nativeRuntime: String
+    let model: String
+    let timeoutMs: UInt64
+    let developmentRoot: String
+}
 struct BackendConfiguration: Codable, Equatable, Sendable {
     let ffmpeg: String
     let ffprobe: String
@@ -227,18 +273,24 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
     let core003Enabled: Bool
     let accurateReencodeTimeoutMs: UInt64
     let core004Enabled: Bool
+    let videoTransformEnabled: Bool?
+    let mixStemsEnabled: Bool?
     let transcodeTimeoutMs: UInt64
+    let aiBackend: AIBackendConfiguration?
     init(ffmpeg: String, ffprobe: String, timeoutMs: UInt64, maxOutputBytes: UInt64,
          core003Enabled: Bool = false, accurateReencodeTimeoutMs: UInt64 = 600000,
-         core004Enabled: Bool = false, transcodeTimeoutMs: UInt64 = 600000) {
+         core004Enabled: Bool = false, videoTransformEnabled: Bool? = nil, mixStemsEnabled: Bool? = nil, transcodeTimeoutMs: UInt64 = 600000,
+         aiBackend: AIBackendConfiguration? = nil) {
         self.ffmpeg = ffmpeg; self.ffprobe = ffprobe; self.timeoutMs = timeoutMs
         self.maxOutputBytes = maxOutputBytes; self.core003Enabled = core003Enabled
         self.accurateReencodeTimeoutMs = accurateReencodeTimeoutMs
-        self.core004Enabled = core004Enabled; self.transcodeTimeoutMs = transcodeTimeoutMs
+        self.core004Enabled = core004Enabled; self.videoTransformEnabled = videoTransformEnabled; self.transcodeTimeoutMs = transcodeTimeoutMs
+        self.mixStemsEnabled = mixStemsEnabled
+        self.aiBackend = aiBackend
     }
     enum CodingKeys: String, CodingKey {
         case ffmpeg, ffprobe, timeoutMs, maxOutputBytes, core003Enabled, accurateReencodeTimeoutMs
-        case core004Enabled, transcodeTimeoutMs
+        case core004Enabled, videoTransformEnabled, mixStemsEnabled, transcodeTimeoutMs, aiBackend
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -248,7 +300,10 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
         core003Enabled = try c.decodeIfPresent(Bool.self, forKey: .core003Enabled) ?? false
         accurateReencodeTimeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .accurateReencodeTimeoutMs) ?? 600000
         core004Enabled = try c.decodeIfPresent(Bool.self, forKey: .core004Enabled) ?? false
+        videoTransformEnabled = try c.decodeIfPresent(Bool.self, forKey: .videoTransformEnabled)
+        mixStemsEnabled = try c.decodeIfPresent(Bool.self, forKey: .mixStemsEnabled)
         transcodeTimeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .transcodeTimeoutMs) ?? 600000
+        aiBackend = try c.decodeIfPresent(AIBackendConfiguration.self, forKey: .aiBackend)
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -264,17 +319,28 @@ struct BackendConfiguration: Codable, Equatable, Sendable {
             try c.encode(true, forKey: .core004Enabled)
             try c.encode(transcodeTimeoutMs, forKey: .transcodeTimeoutMs)
         }
+        try c.encodeIfPresent(videoTransformEnabled, forKey: .videoTransformEnabled)
+        try c.encodeIfPresent(mixStemsEnabled, forKey: .mixStemsEnabled)
+        try c.encodeIfPresent(aiBackend, forKey: .aiBackend)
     }
     static func hostDefault(core003Enabled: Bool = false, core004Enabled: Bool = false) -> Self {
         let environment = ProcessInfo.processInfo.environment
-        return Self(ffmpeg: environment["MEDIASTUDIO_FFMPEG"] ?? "/opt/homebrew/bin/ffmpeg",
-                    ffprobe: environment["MEDIASTUDIO_FFPROBE"] ?? "/opt/homebrew/bin/ffprobe",
+        let bundledFFmpeg = Bundle.main.url(forAuxiliaryExecutable: "ffmpeg")?.path
+        let bundledFFprobe = Bundle.main.url(forAuxiliaryExecutable: "ffprobe")?.path
+        // A missing bundled helper must remain a missing dependency. Do not
+        // silently borrow a developer's globally installed media component.
+        let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent()
+        let expectedFFmpeg = executableDirectory?.appendingPathComponent("ffmpeg").path ?? ""
+        let expectedFFprobe = executableDirectory?.appendingPathComponent("ffprobe").path ?? ""
+        return Self(ffmpeg: environment["MEDIASTUDIO_FFMPEG"] ?? bundledFFmpeg ?? expectedFFmpeg,
+                    ffprobe: environment["MEDIASTUDIO_FFPROBE"] ?? bundledFFprobe ?? expectedFFprobe,
                     timeoutMs: UInt64(environment["MEDIASTUDIO_TIMEOUT_MS"] ?? "30000") ?? 0,
                     maxOutputBytes: UInt64(environment["MEDIASTUDIO_MAX_OUTPUT_BYTES"] ?? "8388608") ?? 0,
                     core003Enabled: core003Enabled,
                     accurateReencodeTimeoutMs: core003Enabled
                         ? UInt64(environment["MEDIASTUDIO_ACCURATE_TIMEOUT_MS"] ?? "600000") ?? 0 : 600000,
                     core004Enabled: core004Enabled,
+                    videoTransformEnabled: core004Enabled && environment["MEDIASTUDIO_VIDEO_TRANSFORM_DEVELOPMENT"] == "1" ? true : nil,
                     transcodeTimeoutMs: core004Enabled
                         ? UInt64(environment["MEDIASTUDIO_TRANSCODE_TIMEOUT_MS"] ?? "600000") ?? 0 : 600000)
     }
@@ -289,6 +355,29 @@ private struct ProbeRequest: Encodable {
     let schemaVersion = 0
     let operation = "probe"
     let source: MediaLocation
+}
+private struct AudioPreviewRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "prepare_audio_preview"
+    let source: MediaLocation
+    let destination: MediaLocation
+    let profile = "wav_pcm_f32_preview_v1"
+}
+private struct AIRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "ai_separate"
+    let source: MediaLocation
+    let destination: MediaLocation
+    let modelId = "umx_hq_vocals_onnx_v1"
+}
+private struct MixStemsRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "mix_stems"
+    let vocals: MediaLocation
+    let accompaniment: MediaLocation
+    let destination: MediaLocation
+    let includeVocals: Bool
+    let includeAccompaniment: Bool
 }
 private struct TrimRequest: Encodable {
     let schemaVersion = 0
@@ -305,6 +394,11 @@ private struct BatchRequest: Encodable {
     let schemaVersion = 0
     let operation = "batch_submit"
     let submissionId: String
+    let items: [QueueMediaRequest]
+}
+private struct StoragePreviewRequest: Encodable {
+    let schemaVersion = 0
+    let operation = "storage_preview"
     let items: [QueueMediaRequest]
 }
 private struct QueueSnapshotRequest: Encodable {
@@ -332,6 +426,24 @@ private func requestData(_ value: some Encodable) throws -> Data {
     encoder.keyEncodingStrategy = .convertToSnakeCase
     return try encoder.encode(value)
 }
+struct AIJobResult: Codable, Sendable {
+    let modelId: String
+    let stems: [String]
+    let directoryName: String
+    let frames: Int64
+    let sampleRate: Int
+    let channels: Int
+    let cleanupUnconfirmed: Bool
+}
+struct MixStemsResult: Codable, Sendable {
+    let fileCreated: Bool
+    let profile: String
+    let sampleRate: Int
+    let channels: Int
+    let sampleCount: Int64
+    let includeVocals: Bool
+    let includeAccompaniment: Bool
+}
 struct JobSnapshot: Codable, Sendable {
     let schemaVersion: Int
     let jobId: String
@@ -340,8 +452,65 @@ struct JobSnapshot: Codable, Sendable {
     let mockOnly: Bool
     let error: JobFailure?
     let result: JobResult?
+    let aiResult: AIJobResult?
+    let mixStemsResult: MixStemsResult?
+    enum CodingKeys: String, CodingKey { case schemaVersion, jobId, operation, state, mockOnly, error, result }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        jobId = try c.decode(String.self, forKey: .jobId)
+        operation = try c.decode(String.self, forKey: .operation)
+        state = try c.decode(String.self, forKey: .state)
+        mockOnly = try c.decode(Bool.self, forKey: .mockOnly)
+        error = try c.decodeIfPresent(JobFailure.self, forKey: .error)
+        if operation == "ai_separate" {
+            aiResult = try c.decodeIfPresent(AIJobResult.self, forKey: .result); result = nil; mixStemsResult = nil
+        } else if operation == "mix_stems" {
+            mixStemsResult = try c.decodeIfPresent(MixStemsResult.self, forKey: .result); result = nil; aiResult = nil
+        } else {
+            result = try c.decodeIfPresent(JobResult.self, forKey: .result); aiResult = nil; mixStemsResult = nil
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(schemaVersion, forKey: .schemaVersion); try c.encode(jobId, forKey: .jobId)
+        try c.encode(operation, forKey: .operation); try c.encode(state, forKey: .state)
+        try c.encode(mockOnly, forKey: .mockOnly); try c.encodeIfPresent(error, forKey: .error)
+        if operation == "ai_separate" { try c.encodeIfPresent(aiResult, forKey: .result) }
+        else if operation == "mix_stems" { try c.encodeIfPresent(mixStemsResult, forKey: .result) }
+        else { try c.encodeIfPresent(result, forKey: .result) }
+    }
+}
+struct AISubmission: Decodable, Sendable {
+    let jobId: String?
+    let accepted: Bool?
+    let errors: [QueueRejection]?
 }
 struct CoreConnection: Codable, Sendable { let version: CoreVersion; let capabilities: CoreCapabilities }
+struct CoreSubmissionRejection: Error, Sendable {
+    let failure: JobFailure
+}
+// CORE-004 single submissions can reject during preflight without allocating
+// a job. Such a response is not a malformed JobSnapshot and owns no job ID.
+private enum SubmissionResponse: Decodable {
+    case job(JobSnapshot)
+    case rejected(JobFailure)
+    private enum CodingKeys: String, CodingKey { case accepted }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.accepted) {
+            let response = try QueueControlResponse(from: decoder)
+            guard !response.accepted, response.jobIds == nil,
+                  let failure = response.errors?.first else {
+                throw DecodingError.dataCorruptedError(forKey: .accepted, in: container,
+                    debugDescription: "Invalid single-submission preflight rejection")
+            }
+            self = .rejected(JobFailure(code: failure.code, message: failure.message))
+        } else {
+            self = .job(try JobSnapshot(from: decoder))
+        }
+    }
+}
 enum MockOutcome: String, Sendable { case succeed, fail }
 struct BridgeError: Error, LocalizedError, Sendable {
     let code: Int32
@@ -422,10 +591,15 @@ private final class EngineOwner {
     func version() throws -> CoreVersion { try output("version", call: ms_get_version) }
     func capabilities() throws -> CoreCapabilities { try output("capabilities", call: ms_get_capabilities) }
     func submit(_ data: Data) throws -> JobSnapshot {
-        let response: JobSnapshot = try data.withUnsafeBytes { bytes in
+        let submission: SubmissionResponse = try data.withUnsafeBytes { bytes in
             try output("submit") { engine, out in
                 ms_submit_job(engine, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, out)
             }
+        }
+        let response: JobSnapshot
+        switch submission {
+        case .job(let value): response = value
+        case .rejected(let failure): throw CoreSubmissionRejection(failure: failure)
         }
         knownJobs.insert(response.jobId)
         return response
@@ -494,11 +668,36 @@ actor CoreBridge {
     func submitProbe(source: URL) throws -> JobSnapshot {
         try submitRawForSelfTest(requestData(ProbeRequest(source: MediaLocation(uri: source.absoluteString))))
     }
+    func submitAudioPreview(source: URL, destination: URL) throws -> JobSnapshot {
+        try submitRawForSelfTest(requestData(AudioPreviewRequest(source: MediaLocation(uri: source.absoluteString), destination: MediaLocation(uri: destination.absoluteString))))
+    }
     func submitTrim(source: URL, destination: URL, range: MediaRange, strategy: ExportStrategy = .legacyStreamCopy) throws -> JobSnapshot {
         guard strategy.transcodePreset == nil else { throw BridgeError(code: -1, operation: "trim_strategy") }
         return try submitRawForSelfTest(requestData(TrimRequest(source: MediaLocation(uri: source.absoluteString),
                                                        destination: MediaLocation(uri: destination.absoluteString), range: range,
                                                        strategy: strategy.wireStrategy, profile: strategy.profile)))
+    }
+    func submitAI(source: URL, destination: URL) throws -> AISubmission {
+        guard !closing, !cleanupUnconfirmed, let owner, backend?.aiBackend != nil else {
+            throw BridgeError(code: -8, operation: "ai_unavailable")
+        }
+        let data = try requestData(AIRequest(source: MediaLocation(uri: source.absoluteString),
+                                             destination: MediaLocation(uri: destination.absoluteString)))
+        let response = try owner.control(data, as: AISubmission.self)
+        if let id = response.jobId { owner.remember([id]) }
+        if response.errors?.contains(where: { $0.code == "CLEANUP_FAILED" }) == true { cleanupUnconfirmed = true }
+        return response
+    }
+    func submitMixStems(directory: URL, destination: URL, includeVocals: Bool, includeAccompaniment: Bool) throws -> JobSnapshot {
+        guard !closing, !cleanupUnconfirmed, let owner, backend?.mixStemsEnabled == true else {
+            throw BridgeError(code: -8, operation: "mix_stems_unavailable")
+        }
+        let data = try requestData(MixStemsRequest(
+            vocals: MediaLocation(uri: directory.appendingPathComponent("vocals.wav").absoluteString),
+            accompaniment: MediaLocation(uri: directory.appendingPathComponent("accompaniment.wav").absoluteString),
+            destination: MediaLocation(uri: destination.absoluteString), includeVocals: includeVocals,
+            includeAccompaniment: includeAccompaniment))
+        return try owner.submit(data)
     }
     func submitRawForSelfTest(_ data: Data) throws -> JobSnapshot {
         guard !closing else { throw BridgeError(code: -7, operation: "closing") }
@@ -539,6 +738,28 @@ actor CoreBridge {
     func batchSubmit(items: [QueueMediaRequest], submissionId: String) throws -> QueueControlResponse {
         try control(requestData(BatchRequest(submissionId: submissionId, items: items)),
                     operation: "batch_submit", submissionId: submissionId, expectedJobs: items.count)
+    }
+    func storagePreview(items: [QueueMediaRequest]) throws -> StoragePreviewResponse {
+        guard !closing, !cleanupUnconfirmed, let owner, backend?.core004Enabled == true else {
+            throw BridgeError(code: -8, operation: "storage_preview_unavailable")
+        }
+        let response = try owner.control(requestData(StoragePreviewRequest(items: items)), as: StoragePreviewResponse.self)
+        guard response.schemaVersion == 0, response.operation == "storage_preview",
+              response.volumes.count <= items.count,
+              Set(response.volumes.map(\.volumeIndex)).count == response.volumes.count else {
+            throw BridgeError(code: -100, operation: "storage_preview_unconfirmed")
+        }
+        let indices = response.volumes.flatMap(\.itemIndices)
+        guard Set(indices).count == indices.count,
+              indices.allSatisfy({ items.indices.contains($0) }),
+              response.volumes.allSatisfy({ $0.volumeIndex >= 0 && !$0.itemIndices.isEmpty &&
+                  $0.sufficient == ($0.availableStorageBytes >= $0.requiredStorageBytes) }),
+              response.errors.allSatisfy({ items.indices.contains($0.index) }),
+              !response.ready || (response.errors.isEmpty && indices.count == items.count && response.volumes.allSatisfy(\.sufficient)) else {
+            throw BridgeError(code: -100, operation: "storage_preview_unconfirmed")
+        }
+        if response.errors.contains(where: { $0.code == "CLEANUP_FAILED" }) { cleanupUnconfirmed = true }
+        return response
     }
     func queueSnapshot() throws -> QueueSnapshot {
         guard !closing else { throw BridgeError(code: -7, operation: "closing") }
@@ -584,7 +805,7 @@ actor CoreBridge {
     func poll(id: String) throws -> JobSnapshot {
         guard let owner else { throw BridgeError(code: -2, operation: "closed") }
         let value = try owner.poll(id)
-        if value.error?.code == "CLEANUP_FAILED" { cleanupUnconfirmed = true }
+        if value.error?.code == "CLEANUP_FAILED" || value.aiResult?.cleanupUnconfirmed == true { cleanupUnconfirmed = true }
         return value
     }
     func cancel(id: String) throws {

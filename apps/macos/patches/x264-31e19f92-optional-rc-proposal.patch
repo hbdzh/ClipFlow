@@ -1,0 +1,511 @@
+--- a/encoder/ratecontrol.c
++++ b/encoder/ratecontrol.c
+@@ -167,6 +167,7 @@
+ 
+     int i_zones;
+     x264_zone_t *zones;
++    x264_zone_t *zones_from_string; /* owns only the generated input array */
+     x264_zone_t *prev_zone;
+ 
+     /* hrd stuff */
+@@ -191,7 +192,7 @@
+     if( ( p = strstr( opts, opt "=" ) ) && sscanf( p, opt "=%d" , &i ) && param_val != i )\
+     {\
+         x264_log( h, X264_LOG_ERROR, "different " opt " setting than first pass (%d vs %d)\n", param_val, i );\
+-        return -1;\
++        goto fail;\
+     }\
+ }
+ 
+@@ -743,6 +744,7 @@
+ int x264_ratecontrol_new( x264_t *h )
+ {
+     x264_ratecontrol_t *rc;
++    char *stats_buf = NULL;
+ 
+     x264_emms();
+ 
+@@ -775,7 +777,7 @@
+     if( h->param.rc.i_rc_method != X264_RC_ABR && h->param.rc.b_stat_read )
+     {
+         x264_log( h, X264_LOG_ERROR, "CRF/CQP is incompatible with 2pass.\n" );
+-        return -1;
++        goto fail;
+     }
+ 
+     x264_ratecontrol_init_reconfigurable( h, 1 );
+@@ -861,13 +863,13 @@
+     if( parse_zones( h ) < 0 )
+     {
+         x264_log( h, X264_LOG_ERROR, "failed to parse zones\n" );
+-        return -1;
++        goto fail;
+     }
+ 
+     /* Load stat file and init 2pass algo */
+     if( h->param.rc.b_stat_read )
+     {
+-        char *p, *stats_in, *stats_buf;
++        char *p, *stats_in;
+ 
+         /* read 1st pass stats */
+         assert( h->param.rc.psz_stat_in );
+@@ -875,19 +877,19 @@
+         if( !stats_buf )
+         {
+             x264_log( h, X264_LOG_ERROR, "ratecontrol_init: can't open stats file\n" );
+-            return -1;
++            goto fail;
+         }
+         if( h->param.rc.b_mb_tree )
+         {
+             char *mbtree_stats_in = strcat_filename( h->param.rc.psz_stat_in, ".mbtree" );
+             if( !mbtree_stats_in )
+-                return -1;
++                goto fail;
+             rc->p_mbtree_stat_file_in = x264_fopen( mbtree_stats_in, "rb" );
+             x264_free( mbtree_stats_in );
+             if( !rc->p_mbtree_stat_file_in )
+             {
+                 x264_log( h, X264_LOG_ERROR, "ratecontrol_init: can't open mbtree stats file\n" );
+-                return -1;
++                goto fail;
+             }
+         }
+ 
+@@ -895,7 +897,7 @@
+         if( strncmp( stats_buf, "#options:", 9 ) )
+         {
+             x264_log( h, X264_LOG_ERROR, "options list in stats file not valid\n" );
+-            return -1;
++            goto fail;
+         }
+ 
+         float res_factor, res_factor_bits;
+@@ -905,13 +907,13 @@
+             char *opts = stats_buf;
+             stats_in = strchr( stats_buf, '\n' );
+             if( !stats_in )
+-                return -1;
++                goto fail;
+             *stats_in = '\0';
+             stats_in++;
+             if( sscanf( opts, "#options: %dx%d", &i, &j ) != 2 )
+             {
+                 x264_log( h, X264_LOG_ERROR, "resolution specified in stats file not valid\n" );
+-                return -1;
++                goto fail;
+             }
+             else if( h->param.rc.b_mb_tree )
+             {
+@@ -926,13 +928,13 @@
+             if( !( p = strstr( opts, "timebase=" ) ) || sscanf( p, "timebase=%u/%u", &k, &l ) != 2 )
+             {
+                 x264_log( h, X264_LOG_ERROR, "timebase specified in stats file not valid\n" );
+-                return -1;
++                goto fail;
+             }
+             if( k != h->param.i_timebase_num || l != h->param.i_timebase_den )
+             {
+                 x264_log( h, X264_LOG_ERROR, "timebase mismatch with 1st pass (%u/%u vs %u/%u)\n",
+                           h->param.i_timebase_num, h->param.i_timebase_den, k, l );
+-                return -1;
++                goto fail;
+             }
+ 
+             CMP_OPT_FIRST_PASS( "bitdepth", BIT_DEPTH );
+@@ -952,7 +954,7 @@
+                 if( strcmp( current, buf ) )
+                 {
+                     x264_log( h, X264_LOG_ERROR, "different interlaced setting than first pass (%s vs %s)\n", current, buf );
+-                    return -1;
++                    goto fail;
+                 }
+             }
+ 
+@@ -966,7 +968,7 @@
+                 {
+                     x264_log( h, X264_LOG_ERROR, "different keyint setting than first pass (%.*s vs %.*s)\n",
+                               strlen(buf)-1, buf, strcspn(p, " "), p );
+-                    return -1;
++                    goto fail;
+                 }
+             }
+ 
+@@ -984,7 +986,7 @@
+             else if( h->param.i_bframe )
+             {
+                 x264_log( h, X264_LOG_ERROR, "b_adapt method specified in stats file not valid\n" );
+-                return -1;
++                goto fail;
+             }
+ 
+             if( (h->param.rc.b_mb_tree || h->param.rc.i_vbv_buffer_size) && ( p = strstr( opts, "rc_lookahead=" ) ) && sscanf( p, "rc_lookahead=%d", &i ) )
+@@ -999,7 +1001,7 @@
+         if( !num_entries )
+         {
+             x264_log( h, X264_LOG_ERROR, "empty stats file\n" );
+-            return -1;
++            goto fail;
+         }
+         rc->num_entries = num_entries;
+ 
+@@ -1012,7 +1014,7 @@
+         {
+             x264_log( h, X264_LOG_ERROR, "2nd pass has more frames than 1st pass (%d vs %d)\n",
+                       h->param.i_frame_total, rc->num_entries );
+-            return -1;
++            goto fail;
+         }
+ 
+         CHECKED_MALLOCZERO( rc->entry, rc->num_entries * sizeof(ratecontrol_entry_t) );
+@@ -1051,12 +1053,12 @@
+             if( frame_number < 0 || frame_number >= rc->num_entries )
+             {
+                 x264_log( h, X264_LOG_ERROR, "bad frame number (%d) at stats line %d\n", frame_number, i );
+-                return -1;
++                goto fail;
+             }
+             if( frame_out_number < 0 || frame_out_number >= rc->num_entries )
+             {
+                 x264_log( h, X264_LOG_ERROR, "bad frame output number (%d) at stats line %d\n", frame_out_number, i );
+-                return -1;
++                goto fail;
+             }
+             rce = &rc->entry[frame_number];
+             rc->entry_out[frame_out_number] = rce;
+@@ -1132,7 +1134,7 @@
+             {
+ parse_error:
+                 x264_log( h, X264_LOG_ERROR, "statistics are damaged at line %d, parser out=%d\n", i, e );
+-                return -1;
++                goto fail;
+             }
+             rce->qscale = qp2qscale( qp_rc );
+             total_qp_aq += qp_aq;
+@@ -1142,11 +1144,12 @@
+             h->pps->i_pic_init_qp = SPEC_QP( (int)(total_qp_aq / rc->num_entries + 0.5) );
+ 
+         x264_free( stats_buf );
++        stats_buf = NULL;
+ 
+         if( h->param.rc.i_rc_method == X264_RC_ABR )
+         {
+             if( init_pass2( h ) < 0 )
+-                return -1;
++                goto fail;
+         } /* else we're using constant quant, so no need to run the bitrate allocation */
+     }
+ 
+@@ -1158,13 +1161,13 @@
+         char *p;
+         rc->psz_stat_file_tmpname = strcat_filename( h->param.rc.psz_stat_out, ".temp" );
+         if( !rc->psz_stat_file_tmpname )
+-            return -1;
++            goto fail;
+ 
+         rc->p_stat_file_out = x264_fopen( rc->psz_stat_file_tmpname, "wb" );
+         if( rc->p_stat_file_out == NULL )
+         {
+             x264_log( h, X264_LOG_ERROR, "ratecontrol_init: can't open stats file\n" );
+-            return -1;
++            goto fail;
+         }
+ 
+         p = x264_param2string( &h->param, 1 );
+@@ -1176,13 +1179,13 @@
+             rc->psz_mbtree_stat_file_tmpname = strcat_filename( h->param.rc.psz_stat_out, ".mbtree.temp" );
+             rc->psz_mbtree_stat_file_name = strcat_filename( h->param.rc.psz_stat_out, ".mbtree" );
+             if( !rc->psz_mbtree_stat_file_tmpname || !rc->psz_mbtree_stat_file_name )
+-                return -1;
++                goto fail;
+ 
+             rc->p_mbtree_stat_file_out = x264_fopen( rc->psz_mbtree_stat_file_tmpname, "wb" );
+             if( rc->p_mbtree_stat_file_out == NULL )
+             {
+                 x264_log( h, X264_LOG_ERROR, "ratecontrol_init: can't open mbtree stats file\n" );
+-                return -1;
++                goto fail;
+             }
+         }
+     }
+@@ -1195,7 +1198,7 @@
+             rc->mbtree.srcdim[1] = h->param.i_height;
+         }
+         if( macroblock_tree_rescale_init( h, rc ) < 0 )
+-            return -1;
++            goto fail;
+     }
+ 
+     for( int i = 0; i<h->param.i_threads; i++ )
+@@ -1212,6 +1215,7 @@
+ 
+     return 0;
+ fail:
++    x264_free( stats_buf );
+     /* Before publication only h owns rc; lookahead has no queued frames and
+      * its extra context was copied before RC construction with rc == NULL. */
+     x264_ratecontrol_abort_open( h );
+@@ -1233,7 +1237,7 @@
+     else
+     {
+         x264_log( h, X264_LOG_ERROR, "invalid zone: \"%s\"\n", p );
+-        return -1;
++        goto fail;
+     }
+     p += len;
+     if( !*p )
+@@ -1253,40 +1257,52 @@
+         if( x264_param_parse( z->param, tok, val ) )
+         {
+             x264_log( h, X264_LOG_ERROR, "invalid zone param: %s = %s\n", tok, val );
+-            return -1;
++            goto fail;
+         }
+         p = NULL;
+     }
+     return 0;
+ fail:
++    if( z->param )
++    {
++        x264_param_cleanup( z->param );
++        x264_free( z->param );
++        z->param = NULL;
++    }
+     return -1;
+ }
+ 
+ static int parse_zones( x264_t *h )
+ {
+     x264_ratecontrol_t *rc = h->rc;
++    char *psz_zones = NULL, *p;
++    x264_zone_t *generated = NULL, *zones = NULL;
++    x264_param_t *default_param = NULL;
++    int original_count = h->param.rc.i_zones;
++    x264_zone_t *original_zones = h->param.rc.zones;
++    int generated_count = 0;
++
+     if( h->param.rc.psz_zones && !h->param.rc.i_zones )
+     {
+-        char *psz_zones, *p;
+         CHECKED_MALLOC( psz_zones, strlen( h->param.rc.psz_zones )+1 );
+         strcpy( psz_zones, h->param.rc.psz_zones );
+-        h->param.rc.i_zones = 1;
++        generated_count = 1;
+         for( p = psz_zones; *p; p++ )
+-            h->param.rc.i_zones += (*p == '/');
+-        CHECKED_MALLOC( h->param.rc.zones, h->param.rc.i_zones * sizeof(x264_zone_t) );
++            generated_count += (*p == '/');
++        CHECKED_MALLOCZERO( generated, generated_count * sizeof(x264_zone_t) );
++        /* Preserve the parameter-copy values used by the existing parser.
++         * h is not published; roll these two private fields back on failure. */
++        h->param.rc.i_zones = generated_count;
++        h->param.rc.zones = generated;
+         p = psz_zones;
+-        for( int i = 0; i < h->param.rc.i_zones; i++ )
++        for( int i = 0; i < generated_count; i++ )
+         {
+             int i_tok = strcspn( p, "/" );
+             p[i_tok] = 0;
+-            if( parse_zone( h, &h->param.rc.zones[i], p ) )
+-            {
+-                x264_free( psz_zones );
+-                return -1;
+-            }
++            if( parse_zone( h, &generated[i], p ) )
++                goto fail;
+             p += i_tok + 1;
+         }
+-        x264_free( psz_zones );
+     }
+ 
+     if( h->param.rc.i_zones > 0 )
+@@ -1298,37 +1314,52 @@
+             {
+                 x264_log( h, X264_LOG_ERROR, "invalid zone: start=%d end=%d\n",
+                           z.i_start, z.i_end );
+-                return -1;
++                goto fail;
+             }
+             else if( !z.b_force_qp && z.f_bitrate_factor <= 0 )
+             {
+                 x264_log( h, X264_LOG_ERROR, "invalid zone: bitrate_factor=%f\n",
+                           z.f_bitrate_factor );
+-                return -1;
+-            }
+-        }
+-
+-        rc->i_zones = h->param.rc.i_zones + 1;
+-        CHECKED_MALLOC( rc->zones, rc->i_zones * sizeof(x264_zone_t) );
+-        memcpy( rc->zones+1, h->param.rc.zones, (rc->i_zones-1) * sizeof(x264_zone_t) );
+-
+-        // default zone to fall back to if none of the others match
+-        rc->zones[0].i_start = 0;
+-        rc->zones[0].i_end = INT_MAX;
+-        rc->zones[0].b_force_qp = 0;
+-        rc->zones[0].f_bitrate_factor = 1;
+-        CHECKED_MALLOC( rc->zones[0].param, sizeof(x264_param_t) );
+-        memcpy( rc->zones[0].param, &h->param, sizeof(x264_param_t) );
+-        rc->zones[0].param->opaque = NULL;
+-        for( int i = 1; i < rc->i_zones; i++ )
+-        {
+-            if( !rc->zones[i].param )
+-                rc->zones[i].param = rc->zones[0].param;
+-        }
+-    }
+-
++                goto fail;
++            }
++        }
++
++        CHECKED_MALLOC( zones, (h->param.rc.i_zones + 1) * sizeof(x264_zone_t) );
++        memcpy( zones+1, h->param.rc.zones, h->param.rc.i_zones * sizeof(x264_zone_t) );
++        zones[0].i_start = 0;
++        zones[0].i_end = INT_MAX;
++        zones[0].b_force_qp = 0;
++        zones[0].f_bitrate_factor = 1;
++        CHECKED_MALLOC( default_param, sizeof(x264_param_t) );
++        memcpy( default_param, &h->param, sizeof(x264_param_t) );
++        default_param->opaque = NULL;
++        zones[0].param = default_param;
++        for( int i = 1; i <= h->param.rc.i_zones; i++ )
++            if( !zones[i].param )
++                zones[i].param = default_param;
++    }
++
++    /* Publish a complete graph only. Generated parameter objects now belong
++     * to rc->zones; the extra input array has its own explicit owner. */
++    rc->zones = zones;
++    rc->i_zones = zones ? h->param.rc.i_zones + 1 : 0;
++    rc->zones_from_string = generated;
++    x264_free( psz_zones );
+     return 0;
+ fail:
++    h->param.rc.i_zones = original_count;
++    h->param.rc.zones = original_zones;
++    if( generated )
++        for( int i = 0; i < generated_count; i++ )
++            if( generated[i].param )
++            {
++                x264_param_cleanup( generated[i].param );
++                x264_free( generated[i].param );
++            }
++    x264_free( default_param );
++    x264_free( zones );
++    x264_free( generated );
++    x264_free( psz_zones );
+     return -1;
+ }
+ 
+@@ -1357,25 +1388,59 @@
+     }
+ }
+ 
++static void ratecontrol_abort_zones( x264_t *h )
++{
++    x264_ratecontrol_t *rc = h->rc;
++    if( rc->zones )
++    {
++        x264_param_t *default_param = rc->zones[0].param;
++        /* Only string parsing created library-owned custom parameter objects.
++         * Caller-supplied callback ownership on failed open is not specified;
++         * leave those external objects and their arenas untouched. */
++        if( rc->zones_from_string )
++            for( int i = 1; i < rc->i_zones; i++ )
++                if( rc->zones[i].param != default_param )
++                {
++                    x264_param_cleanup( rc->zones[i].param );
++                    x264_free( rc->zones[i].param );
++                }
++        x264_param_cleanup( default_param );
++        x264_free( default_param );
++        x264_free( rc->zones );
++    }
++    if( rc->zones_from_string && h->param.rc.zones == rc->zones_from_string )
++    {
++        h->param.rc.zones = NULL;
++        h->param.rc.i_zones = 0;
++    }
++    x264_free( rc->zones_from_string );
++}
++
+ int x264_ratecontrol_abort_open( x264_t *h )
+ {
+     x264_ratecontrol_t *rc = h->rc;
+     if( !rc )
+         return 0;
+ 
+-    /* The fixed product presets never transfer zone parameters or open stats
+-     * files. Those optional owners need a separate staged abort contract;
+-     * successful-close may publish files and is not an abort operation. */
+-    if( h->param.rc.b_stat_read || h->param.rc.b_stat_write ||
+-        h->param.rc.i_zones || h->param.rc.psz_zones )
+-        return -1;
+-
+-    /* The rc array is zeroed before the first fallible step. On this path
+-     * only these two allocations are made; per-thread copies borrow them. */
++    /* Abort never publishes statistics and never unlinks paths whose prior
++     * existence/identity is not owned here. Leave temporary files for review. */
++    if( rc->p_stat_file_out )
++        fclose( rc->p_stat_file_out );
++    if( rc->p_mbtree_stat_file_out )
++        fclose( rc->p_mbtree_stat_file_out );
++    if( rc->p_mbtree_stat_file_in )
++        fclose( rc->p_mbtree_stat_file_in );
++    x264_free( rc->psz_stat_file_tmpname );
++    x264_free( rc->psz_mbtree_stat_file_tmpname );
++    x264_free( rc->psz_mbtree_stat_file_name );
++    x264_free( rc->pred );
++    x264_free( rc->pred_b_from_p );
++    x264_free( rc->entry );
++    x264_free( rc->entry_out );
++    macroblock_tree_rescale_destroy( rc );
++    ratecontrol_abort_zones( h );
+     for( int i = 0; i < h->param.i_threads; i++ )
+         h->thread[i]->rc = NULL;
+-    x264_free( rc->pred );
+-    x264_free( rc->pred_b_from_p );
+     x264_free( rc );
+     h->rc = NULL;
+     return 0;
+@@ -1430,6 +1495,7 @@
+             }
+         x264_free( rc->zones );
+     }
++    x264_free( rc->zones_from_string );
+     x264_free( rc );
+ }
+ 
+@@ -2948,7 +3014,7 @@
+     double cplxblur = h->param.rc.f_complexity_blur;
+     const int filter_size = (int)(qblur*4) | 1;
+     double expected_bits;
+-    double *qscale, *blurred_qscale;
++    double *qscale = NULL, *blurred_qscale = NULL;
+     double base_cplx = h->mb.i_mb_count * (h->param.i_bframe ? 120 : 80);
+ 
+     /* find total/average complexity & const_bits */
+@@ -3134,5 +3200,8 @@
+ 
+     return 0;
+ fail:
++    x264_free( qscale );
++    if( filter_size > 1 )
++        x264_free( blurred_qscale );
+     return -1;
+ }
+--- a/encoder/ratecontrol.h
++++ b/encoder/ratecontrol.h
+@@ -41,9 +41,9 @@
+ 
+ #define x264_ratecontrol_new x264_template(ratecontrol_new)
+ int  x264_ratecontrol_new   ( x264_t * );
+-/* Encoder-open abort only, before frames/jobs are submitted, with all encoder
+- * contexts initialized and no RC user active. Returns -1 for optional stats/
+- * zones owners, leaving h->rc unchanged instead of using commit-on-close. */
++/* Encoder-open abort only, before frames/jobs or publication, with all encoder
++ * contexts initialized and no RC user active. Closes streams without rename or
++ * unlink, frees library-owned state, and preserves caller zone callbacks. */
+ #define x264_ratecontrol_abort_open x264_template(ratecontrol_abort_open)
+ int  x264_ratecontrol_abort_open( x264_t * );
+ #define x264_ratecontrol_delete x264_template(ratecontrol_delete)

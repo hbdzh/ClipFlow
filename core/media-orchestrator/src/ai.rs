@@ -3,9 +3,9 @@
 //! hostile same-UID modifications. This module is not an OS sandbox.
 use media_ai::{
     AtomicDirectory, CommitOutcome, TransactionError,
-    runner::{RunError, run_group},
+    runner::{RunError, run_group, run_group_with_status},
 };
-use media_domain::{AiBackendConfig, BackendConfig, MediaError};
+use media_domain::{AiBackendConfig, AiWorker, BackendConfig, MediaError};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -34,6 +34,17 @@ fn err(code: &'static str, message: &'static str) -> MediaError {
 }
 pub(crate) fn any_reserved() -> bool {
     RESERVED.load(Ordering::Acquire) || QUARANTINED.load(Ordering::Acquire)
+}
+#[cfg(test)]
+pub(crate) fn reservation_for_queue_test() -> impl Drop {
+    assert!(
+        RESERVED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    );
+    Lease {
+        poisoned: AtomicBool::new(false),
+    }
 }
 struct Lease {
     poisoned: AtomicBool,
@@ -140,6 +151,20 @@ fn run_error(error: RunError) -> MediaError {
             "AI process diagnostics exceeded their limit.",
         ),
         _ => err("PROCESS_FAILED", "The AI worker failed."),
+    }
+}
+
+fn native_worker_failure(code: Option<i32>, stdout: &[u8]) -> MediaError {
+    if code == Some(73)
+        && serde_json::from_slice::<Value>(stdout).ok()
+            == Some(json!({"schema_version":1,"error":"OUT_OF_DISK"}))
+    {
+        err(
+            "OUT_OF_DISK",
+            "The AI output volume has insufficient space.",
+        )
+    } else {
+        err("PROCESS_FAILED", "The AI worker failed.")
     }
 }
 fn sha256(path: &Path, timeout: u64) -> Result<String, MediaError> {
@@ -377,8 +402,7 @@ struct Snapshot {
     source: PathBuf,
     source_handle: File,
     source_identity: fs::Metadata,
-    python_identity: fs::Metadata,
-    worker_identity: fs::Metadata,
+    component_identities: Vec<(PathBuf, fs::Metadata)>,
     model_identity: fs::Metadata,
     config: AiBackendConfig,
     frames: u64,
@@ -523,11 +547,12 @@ impl Snapshot {
         {
             return Err(err("SOURCE_CHANGED", "Input changed during processing."));
         }
-        for (path, old) in [
-            (&self.config.python, &self.python_identity),
-            (&self.config.worker, &self.worker_identity),
-            (&self.config.model, &self.model_identity),
-        ] {
+        for (path, old) in self
+            .component_identities
+            .iter()
+            .map(|(path, metadata)| (path, metadata))
+            .chain(std::iter::once((&self.config.model, &self.model_identity)))
+        {
             let m = fs::metadata(path)
                 .map_err(|_| err("SOURCE_CHANGED", "A required AI component changed."))?;
             if !stable(old, &m) {
@@ -887,20 +912,15 @@ impl AiPlan {
             }
             Err(e) => return Err(e),
         };
-        let (_, worker_meta) = regular(&a.worker)
-            .map_err(|_| err("DEPENDENCY_MISSING", "The AI worker is unavailable."))?;
+        let worker_meta = match &a.worker {
+            AiWorker::Python { script, .. } => regular(script)
+                .map(|(_, metadata)| metadata)
+                .map_err(|_| err("DEPENDENCY_MISSING", "The AI worker is unavailable."))?,
+            AiWorker::Native { executable, .. } => fs::metadata(executable)
+                .map_err(|_| err("DEPENDENCY_MISSING", "The AI worker is unavailable."))?,
+        };
         let (_, model_meta) = regular(&a.model)
             .map_err(|_| err("DEPENDENCY_MISSING", "The AI model is unavailable."))?;
-        // Python launcher in a venv is often a symlink; trusted local configuration
-        // and metadata of its resolved regular binary remain required.
-        let python_meta = fs::metadata(&a.python)
-            .map_err(|_| err("DEPENDENCY_MISSING", "The Python runtime is unavailable."))?;
-        if !python_meta.is_file() {
-            return Err(err(
-                "DEPENDENCY_MISSING",
-                "The Python runtime is unavailable.",
-            ));
-        }
         let remaining_ms = || -> Result<u64, MediaError> {
             let ms = preflight_deadline
                 .saturating_duration_since(Instant::now())
@@ -911,12 +931,59 @@ impl AiPlan {
                 Ok(ms.min(u64::MAX as u128) as u64)
             }
         };
-        if sha256(&a.worker, remaining_ms()?)? != WORKER_SHA {
-            return Err(err(
-                "DEPENDENCY_MISSING",
-                "The fixed worker identity does not match.",
-            ));
-        }
+        let component_identities = match &a.worker {
+            AiWorker::Python { python, script } => {
+                // A venv launcher may be a symlink to its interpreter.
+                let python_meta = fs::metadata(python)
+                    .map_err(|_| err("DEPENDENCY_MISSING", "The Python runtime is unavailable."))?;
+                if !python_meta.is_file() {
+                    return Err(err(
+                        "DEPENDENCY_MISSING",
+                        "The Python runtime is unavailable.",
+                    ));
+                }
+                if sha256(script, remaining_ms()?)? != WORKER_SHA {
+                    return Err(err(
+                        "DEPENDENCY_MISSING",
+                        "The fixed worker identity does not match.",
+                    ));
+                }
+                vec![(python.clone(), python_meta), (script.clone(), worker_meta)]
+            }
+            AiWorker::Native {
+                executable,
+                graphs,
+                runtime,
+            } => {
+                if !worker_meta.is_file()
+                    || worker_meta.len() == 0
+                    || worker_meta.mode() & 0o111 == 0
+                {
+                    return Err(err("DEPENDENCY_MISSING", "The AI worker is unavailable."));
+                }
+                let runtime_meta = fs::metadata(runtime)
+                    .map_err(|_| err("DEPENDENCY_MISSING", "The AI runtime is unavailable."))?;
+                if !runtime_meta.is_file() || runtime_meta.len() == 0 {
+                    return Err(err("DEPENDENCY_MISSING", "The AI runtime is unavailable."));
+                }
+                let graphs_meta = fs::metadata(graphs).map_err(|_| {
+                    err("DEPENDENCY_MISSING", "The AI model graphs are unavailable.")
+                })?;
+                if !graphs_meta.is_dir() {
+                    return Err(err(
+                        "DEPENDENCY_MISSING",
+                        "The AI model graphs are unavailable.",
+                    ));
+                }
+                // Development paths are trusted. Final packaged binary/runtime
+                // identity and distribution verification are separate gates.
+                vec![
+                    (executable.clone(), worker_meta),
+                    (graphs.clone(), graphs_meta),
+                    (runtime.clone(), runtime_meta),
+                ]
+            }
+        };
         if sha256(&a.model, remaining_ms()?)? != MODEL_SHA {
             return Err(err(
                 "MODEL_INVALID",
@@ -971,8 +1038,7 @@ impl AiPlan {
             source: source.to_owned(),
             source_handle: source_file,
             source_identity: source_meta,
-            python_identity: python_meta,
-            worker_identity: worker_meta,
+            component_identities,
             model_identity: model_meta,
             config: a,
             frames,
@@ -1078,24 +1144,46 @@ impl AiPlan {
                 self.snapshot.source.clone()
             };
             let a = &self.snapshot.config;
-            let args: Vec<OsString> = vec![
-                "-I".into(),
-                a.worker.as_os_str().into(),
+            let (program, mut args): (&Path, Vec<OsString>) = match &a.worker {
+                AiWorker::Python { python, script } => {
+                    (python, vec!["-I".into(), script.as_os_str().into()])
+                }
+                AiWorker::Native {
+                    executable,
+                    graphs,
+                    runtime,
+                } => (
+                    executable,
+                    vec![
+                        "--graphs".into(),
+                        graphs.as_os_str().into(),
+                        "--runtime".into(),
+                        runtime.as_os_str().into(),
+                    ],
+                ),
+            };
+            args.extend([
                 "--model".into(),
                 a.model.as_os_str().into(),
                 "--input".into(),
                 input.into_os_string(),
                 "--staging".into(),
                 tx.staging().as_os_str().into(),
-            ];
-            let result = run_group(
-                &a.python,
-                &args,
-                deadline.saturating_duration_since(Instant::now()),
-                cancel,
-                16384,
-            )
-            .map_err(run_error)?;
+            ]);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = if matches!(a.worker, AiWorker::Native { .. }) {
+                let value = run_group_with_status(program, &args, remaining, cancel, 16384)
+                    .map_err(run_error)?;
+                if !value.status.success() {
+                    return Err(native_worker_failure(
+                        value.status.code(),
+                        &value.output.stdout,
+                    ));
+                }
+                value.output
+            } else {
+                run_group(program, &args, remaining, cancel, 16384).map_err(run_error)?
+            };
             self.snapshot.verify()?;
             let value: Value = serde_json::from_slice(&result.stdout)
                 .map_err(|_| err("PROCESS_FAILED", "The AI worker response is invalid."))?;
@@ -1196,5 +1284,25 @@ impl AiReady {
             result["normalization"] = detail.clone();
         }
         Ok((result, uncertain))
+    }
+}
+
+#[cfg(test)]
+mod native_error_tests {
+    use super::*;
+
+    #[test]
+    fn native_storage_failure_requires_both_fixed_status_and_response() {
+        let body = br#"{"schema_version":1,"error":"OUT_OF_DISK"}"#;
+        assert_eq!(native_worker_failure(Some(73), body).code, "OUT_OF_DISK");
+        for code in [None, Some(1), Some(28)] {
+            assert_eq!(native_worker_failure(code, body).code, "PROCESS_FAILED");
+        }
+        for invalid in [b"OUT_OF_DISK".as_slice(), br#"{"error":"OUT_OF_DISK"}"#] {
+            assert_eq!(
+                native_worker_failure(Some(73), invalid).code,
+                "PROCESS_FAILED"
+            );
+        }
     }
 }

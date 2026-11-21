@@ -143,7 +143,9 @@ fn rejected(operation: &str, index: usize, code: &str, message: &str) -> Value {
 }
 fn source_name(request: &MediaRequest) -> String {
     let path = match request {
-        MediaRequest::Probe { source }
+        MediaRequest::MixStems { vocals: source, .. }
+        | MediaRequest::Probe { source }
+        | MediaRequest::PrepareAudioPreview { source, .. }
         | MediaRequest::Trim { source, .. }
         | MediaRequest::Transcode { source, .. } => source,
     };
@@ -154,9 +156,10 @@ fn source_name(request: &MediaRequest) -> String {
 }
 fn destination(request: &MediaRequest) -> Option<&std::path::Path> {
     match request {
-        MediaRequest::Trim { destination, .. } | MediaRequest::Transcode { destination, .. } => {
-            Some(destination)
-        }
+        MediaRequest::MixStems { destination, .. }
+        | MediaRequest::PrepareAudioPreview { destination, .. }
+        | MediaRequest::Trim { destination, .. }
+        | MediaRequest::Transcode { destination, .. } => Some(destination),
         _ => None,
     }
 }
@@ -175,7 +178,9 @@ fn summary(request: &MediaRequest, prepared: &PreparedMedia) -> Value {
     );
     object.insert("operation".into(), json!(request.operation()));
     match request {
-        MediaRequest::Probe { .. } => {
+        MediaRequest::MixStems { .. }
+        | MediaRequest::PrepareAudioPreview { .. }
+        | MediaRequest::Probe { .. } => {
             object.insert("requested_range_us".into(), Value::Null);
             object.insert("profile".into(), Value::Null);
             object.insert("audio_selection".into(), Value::Null);
@@ -204,6 +209,7 @@ fn summary(request: &MediaRequest, prepared: &PreparedMedia) -> Value {
             range,
             profile,
             audio_selection,
+            video_transform,
             ..
         } => {
             object.insert(
@@ -214,6 +220,7 @@ fn summary(request: &MediaRequest, prepared: &PreparedMedia) -> Value {
                 ),
             );
             object.insert("profile".into(), json!(profile.as_str()));
+            object.insert("video_transform".into(), video_transform.map_or(Value::Null, |t| json!({"rotation_degrees":t.rotation_degrees,"scale_percent":t.scale_percent,"offset_x":t.offset_x,"offset_y":t.offset_y})));
             object.insert(
                 "audio_selection".into(),
                 match audio_selection {
@@ -308,6 +315,31 @@ impl QueueEngine {
                 }
             }
             Request::Media(request) => self.accept(vec![request], None, "submit"),
+            Request::Queue(QueueCommand::StoragePreview { items }) => {
+                let _admission = admission()?;
+                #[cfg(target_os = "macos")]
+                if super::ai::any_reserved() {
+                    return Ok(
+                        json!({"schema_version":0,"operation":"storage_preview","ready":false,"volumes":[],"errors":[{"index":0,"code":"RESOURCE_LIMIT","message":"A development AI reservation is active."}]}),
+                    );
+                }
+                let state = self.shared.0.lock().map_err(|_| CoreError::Internal)?;
+                if state.shutdown
+                    || state.cleanup_failed
+                    || heavy::quarantined()
+                    || media_ffmpeg::quarantined()
+                {
+                    return Ok(
+                        json!({"schema_version":0,"operation":"storage_preview","ready":false,"volumes":[],"errors":[{"index":0,"code":"CLEANUP_FAILED","message":"The engine cannot safely preview new work."}]}),
+                    );
+                }
+                drop(state);
+                Ok(media_ffmpeg::storage_preview(
+                    &self.config,
+                    &items,
+                    &AtomicBool::new(false),
+                ))
+            }
             Request::Queue(QueueCommand::Snapshot) => Ok(self
                 .shared
                 .0
@@ -398,7 +430,9 @@ impl QueueEngine {
                         }
                     };
                     match &mut request {
-                        MediaRequest::Trim { destination, .. }
+                        MediaRequest::MixStems { destination, .. }
+                        | MediaRequest::PrepareAudioPreview { destination, .. }
+                        | MediaRequest::Trim { destination, .. }
                         | MediaRequest::Transcode { destination, .. } => {
                             if destination == new_destination {
                                 return Ok(rejected(
@@ -513,6 +547,13 @@ impl QueueEngine {
         operation: &str,
     ) -> Result<Value, CoreError> {
         let _admission = admission()?;
+        // Reading an accepted receipt does not admit more work. Preserve its
+        // identity even while another subsystem owns the heavy-work reservation.
+        if let Some(command) = &command
+            && let Some(value) = self.replay(command, operation)?
+        {
+            return Ok(value);
+        }
         #[cfg(target_os = "macos")]
         if super::ai::any_reserved() {
             return Ok(rejected(
@@ -521,11 +562,6 @@ impl QueueEngine {
                 "RESOURCE_LIMIT",
                 "A development AI reservation is active.",
             ));
-        }
-        if let Some(command) = &command
-            && let Some(value) = self.replay(command, operation)?
-        {
-            return Ok(value);
         }
         {
             let state = self.shared.0.lock().map_err(|_| CoreError::Internal)?;
@@ -695,8 +731,12 @@ impl QueueEngine {
     }
     pub(crate) fn cancel(&self, id: &str) -> Result<(), CoreError> {
         validate_job_id(id)?;
+        let _publish = media_ffmpeg::mix_publish_guard().map_err(|_| CoreError::Internal)?;
         let mut state = self.shared.0.lock().map_err(|_| CoreError::Internal)?;
         let job = state.jobs.get_mut(id).ok_or(CoreError::NotFound)?;
+        if matches!(&job.prepared, Some(QueuePlan::Media(plan)) if plan.mix_published()) {
+            return Ok(());
+        }
         match job.state {
             JobState::Queued => {
                 job.cancel.store(true, Ordering::Release);
@@ -1022,4 +1062,52 @@ fn bounded(value: Value) -> Result<Value, CoreError> {
         return Err(CoreError::LimitExceeded);
     }
     Ok(value)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod replay_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_batch_replays_during_ai_reservation_without_new_admission() {
+        let config = media_domain::parse_config(br#"{"schema_version":0,"media_backend":{"ffmpeg":"/missing-queue-test/ffmpeg","ffprobe":"/missing-queue-test/ffprobe","core003_enabled":true,"core004_enabled":true}}"#)
+            .unwrap().media_backend.unwrap();
+        let mut engine = QueueEngine::new(config).unwrap();
+        let input = br#"{"schema_version":0,"operation":"batch_submit","submission_id":"accepted_before_ai","items":[{"schema_version":0,"operation":"trim","source":{"uri":"file:///missing-queue-test/source.mp4"},"destination":{"uri":"file:///missing-queue-test/output.mp4"},"range":{"start_us":0,"end_us":1000000},"strategy":"accurate_reencode","profile":"mp4_h264_standard_v1","stream_selection":"all_supported","allow_reencode_fallback":false}]}"#;
+        let Request::Queue(command) = parse_request_with_ai(input, false).unwrap() else {
+            panic!("batch command")
+        };
+        // Model a retained receipt after its job details have been pruned. The
+        // contract still returns its original IDs and must never replace them.
+        engine
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .submissions
+            .push_back(Submission {
+                id: "accepted_before_ai".into(),
+                fingerprint: command,
+                job_ids: vec!["media-42".into()],
+            });
+        let reservation = super::super::ai::reservation_for_queue_test();
+        let replay = engine.submit(input).unwrap();
+        assert_eq!(replay["accepted"], true, "{replay}");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["job_ids"], json!(["media-42"]));
+        assert!(engine.shared.0.lock().unwrap().jobs.is_empty());
+        let changed = std::str::from_utf8(input)
+            .unwrap()
+            .replace("1000000", "2000000");
+        let conflict = engine.submit(changed.as_bytes()).unwrap();
+        assert_eq!(conflict["accepted"], false);
+        assert_eq!(conflict["errors"][0]["code"], "SUBMISSION_CONFLICT");
+        let fresh = std::str::from_utf8(input)
+            .unwrap()
+            .replace("accepted_before_ai", "fresh_during_ai");
+        let blocked = engine.submit(fresh.as_bytes()).unwrap();
+        assert_eq!(blocked["accepted"], false);
+        assert_eq!(blocked["errors"][0]["code"], "RESOURCE_LIMIT");
+        drop(reservation);
+    }
 }

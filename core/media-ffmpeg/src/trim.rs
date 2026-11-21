@@ -304,12 +304,24 @@ pub(crate) fn execute(
             let source_layout = media
                 .streams
                 .iter()
-                .map(|s| (&s["codec_type"], &s["codec_name"], &s["language"]))
+                .map(|s| {
+                    (
+                        &s["codec_type"],
+                        &s["codec_name"],
+                        crate::media::language(&s["language"]),
+                    )
+                })
                 .collect::<Vec<_>>();
             let output_layout = output
                 .streams
                 .iter()
-                .map(|s| (&s["codec_type"], &s["codec_name"], &s["language"]))
+                .map(|s| {
+                    (
+                        &s["codec_type"],
+                        &s["codec_name"],
+                        crate::media::language(&s["language"]),
+                    )
+                })
                 .collect::<Vec<_>>();
             if source_layout != output_layout {
                 return Err(MediaError::new(

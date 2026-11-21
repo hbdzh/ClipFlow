@@ -1,0 +1,86 @@
+--- a/common/macroblock.c
++++ b/common/macroblock.c
+@@ -352,13 +352,19 @@
+ 
+ int x264_macroblock_thread_allocate( x264_t *h, int b_lookahead )
+ {
++    /* Keep construction-private owners out of copied/shared contexts until
++     * every allocation succeeds. Border entries retain their malloc bases. */
++    pixel *intra_border_backup[5][3] = {{ NULL }};
++    uint8_t (*deblock_strength[2])[2][8][4] = { NULL, NULL };
++    void *scratch_buffer = NULL;
++    void *scratch_buffer2 = NULL;
++
+     if( !b_lookahead )
+     {
+         for( int i = 0; i < (PARAM_INTERLACED ? 5 : 2); i++ )
+             for( int j = 0; j < (CHROMA444 ? 3 : 2); j++ )
+             {
+-                CHECKED_MALLOC( h->intra_border_backup[i][j], (h->sps->i_mb_width*16+32) * SIZEOF_PIXEL );
+-                h->intra_border_backup[i][j] += 16;
++                CHECKED_MALLOC( intra_border_backup[i][j], (h->sps->i_mb_width*16+32) * SIZEOF_PIXEL );
+             }
+         for( int i = 0; i <= PARAM_INTERLACED; i++ )
+         {
+@@ -367,13 +373,14 @@
+                 /* Only allocate the first one, and allocate it for the whole frame, because we
+                  * won't be deblocking until after the frame is fully encoded. */
+                 if( h == h->thread[0] && !i )
+-                    CHECKED_MALLOC( h->deblock_strength[0], sizeof(**h->deblock_strength) * h->mb.i_mb_count );
++                    CHECKED_MALLOC( deblock_strength[0], sizeof(**h->deblock_strength) * h->mb.i_mb_count );
+                 else
+-                    h->deblock_strength[i] = h->thread[0]->deblock_strength[0];
++                    deblock_strength[i] = h == h->thread[0] ? deblock_strength[0]
++                                                          : h->thread[0]->deblock_strength[0];
+             }
+             else
+-                CHECKED_MALLOC( h->deblock_strength[i], sizeof(**h->deblock_strength) * h->mb.i_mb_width );
+-            h->deblock_strength[1] = h->deblock_strength[i];
++                CHECKED_MALLOC( deblock_strength[i], sizeof(**h->deblock_strength) * h->mb.i_mb_width );
++            deblock_strength[1] = deblock_strength[i];
+         }
+     }
+ 
+@@ -391,17 +398,38 @@
+     int buf_mbtree = h->param.rc.b_mb_tree * ALIGN( h->mb.i_mb_width * sizeof(int16_t), NATIVE_ALIGN );
+     scratch_size = X264_MAX( scratch_size, buf_mbtree );
+     if( scratch_size )
+-        CHECKED_MALLOC( h->scratch_buffer, scratch_size );
++        CHECKED_MALLOC( scratch_buffer, scratch_size );
+     else
+-        h->scratch_buffer = NULL;
++        scratch_buffer = NULL;
+ 
+     int buf_lookahead_threads = (h->mb.i_mb_height + (4 + 32) * h->param.i_lookahead_threads) * sizeof(int) * 2;
+     int buf_mbtree2 = buf_mbtree * 12; /* size of the internal propagate_list asm buffer */
+     scratch_size = X264_MAX( buf_lookahead_threads, buf_mbtree2 );
+-    CHECKED_MALLOC( h->scratch_buffer2, scratch_size );
+-
++    CHECKED_MALLOC( scratch_buffer2, scratch_size );
++
++    if( !b_lookahead )
++    {
++        for( int i = 0; i < (PARAM_INTERLACED ? 5 : 2); i++ )
++            for( int j = 0; j < (CHROMA444 ? 3 : 2); j++ )
++                h->intra_border_backup[i][j] = intra_border_backup[i][j] + 16;
++        h->deblock_strength[0] = deblock_strength[0];
++        h->deblock_strength[1] = deblock_strength[1];
++    }
++    h->scratch_buffer = scratch_buffer;
++    h->scratch_buffer2 = scratch_buffer2;
+     return 0;
+ fail:
++    if( !b_lookahead )
++    {
++        for( int i = 0; i <= PARAM_INTERLACED; i++ )
++            if( !h->param.b_sliced_threads || (h == h->thread[0] && !i) )
++                x264_free( deblock_strength[i] );
++        for( int i = 0; i < (PARAM_INTERLACED ? 5 : 2); i++ )
++            for( int j = 0; j < (CHROMA444 ? 3 : 2); j++ )
++                x264_free( intra_border_backup[i][j] );
++    }
++    x264_free( scratch_buffer );
++    x264_free( scratch_buffer2 );
+     return -1;
+ }
+ 

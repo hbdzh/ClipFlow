@@ -166,10 +166,14 @@ fn layout(
     let mut channels = Vec::new();
     let mut max_av_error = 0_i64;
     for (before, after) in source.streams.iter().zip(&output.streams) {
-        for key in ["codec_type", "codec_name", "language"] {
+        for key in ["codec_type", "codec_name"] {
             if before[key] != after[key] {
                 return Err(validation());
             }
+        }
+        if crate::media::language(&before["language"]) != crate::media::language(&after["language"])
+        {
+            return Err(validation());
         }
         if before["codec_type"] == "video" {
             for key in ["width", "height", "pix_fmt", "sample_aspect_ratio"] {
@@ -421,8 +425,9 @@ pub(crate) fn execute_options(
         if let Some(o) = options {
             for stream in &mut layout_reference.streams {
                 if stream["codec_type"] == "video" {
-                    stream["width"] = json!(o.canvas_width);
-                    stream["height"] = json!(o.canvas_height);
+                    let (width, height) = o.output_size();
+                    stream["width"] = json!(width);
+                    stream["height"] = json!(height);
                 }
             }
         }

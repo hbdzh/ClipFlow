@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -18,6 +19,47 @@ func parseTimeText(_ text: String) -> Int64? {
     guard !overflow, let tail = Int64(fraction + String(repeating: "0", count: 6 - fraction.count)) else { return nil }
     let (value, additionOverflow) = base.addingReportingOverflow(tail)
     return additionOverflow ? nil : value
+}
+
+// A presentation grid from Core metadata. Core still owns export eligibility,
+// actual frame selection and all media commands.
+struct PreviewFrameGrid {
+    let rateNumerator: Int64
+    let rateDenominator: Int64
+    let frameCount: Int64
+    let durationUs: Int64
+    init?(media: MediaInfo) {
+        guard let stream = media.streams.first(where: { $0.codecType == "video" }),
+              let rate = Self.rational(media.videoCfrRate),
+              let base = Self.rational(stream.timeBase), let count = media.videoFrameCount, count > 0,
+              (rate.1 * base.1) % (rate.0 * base.0) == 0,
+              media.durationUs > 0, media.durationUs <= 8_000_000_000_000 else { return nil }
+        rateNumerator = rate.0; rateDenominator = rate.1
+        frameCount = Int64(count); durationUs = media.durationUs
+        let (scaled, overflow) = frameCount.multipliedReportingOverflow(by: rateDenominator * 1_000_000)
+        guard !overflow, abs(scaled / rateNumerator - media.durationUs) <= 1 else { return nil }
+    }
+    private static func rational(_ text: String?) -> (Int64, Int64)? {
+        guard let text else { return nil }
+        let parts = text.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, let numerator = Int64(parts[0]), let denominator = Int64(parts[1]),
+              (1...1_000_000).contains(numerator), (1...1_000_000).contains(denominator) else { return nil }
+        return (numerator, denominator)
+    }
+    func microseconds(at index: Int64) -> Int64 {
+        if index >= frameCount { return durationUs }
+        return index * rateDenominator * 1_000_000 / rateNumerator
+    }
+    func nextIndex(from positionUs: Int64, direction: Int) -> Int64 {
+        let position = max(0, min(durationUs, positionUs))
+        var low: Int64 = 0, high = frameCount
+        while low < high {
+            let mid = low + (high - low) / 2
+            if microseconds(at: mid) < position { low = mid + 1 } else { high = mid }
+        }
+        if direction < 0 { return max(0, low - 1) }
+        return min(frameCount, microseconds(at: low) > position ? low : low + 1)
+    }
 }
 
 struct AccessDiagnostics: Codable, Sendable {
@@ -64,9 +106,12 @@ final class WorkspaceModel: ObservableObject {
     @Published var submissionErrors: [QueueRejection] = []
     @Published var isSubmitting = false
     @Published var audioSelection: AudioSelection = .all { didSet { saveSelectedEdits() } }
+    @Published var videoTransform: VideoTransform = .identity { didSet { saveSelectedEdits() } }
     var queueRequests: [UUID: ActiveExport] = [:]
     var queueLeases: [UUID: [SecurityAccess]] = [:]
     var pendingQueue: PendingQueueSubmission?
+    var pendingQueueNeedsConfirmation = false
+    @Published var storagePreview: ExportSpacePreview?
     var queuePollTask: Task<Void, Never>?
     var queueRefreshInProgress = false
     var queueCancelRequested = false
@@ -75,6 +120,7 @@ final class WorkspaceModel: ObservableObject {
     // connection boundaries; it never supplies a job state or media result.
     var queueSubmissionObserver: ((String) async -> Void)?
     private let recentStore: RecentTaskStore
+    private var historyObservation: AnyCancellable?
     @Published var assets: [WorkspaceAsset] = []
     @Published var selectedAssetId: UUID?
     @Published var tasks: [WorkspaceTask]
@@ -84,7 +130,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var sourceURL: URL?
     @Published var mediaInfo: MediaInfo?
     @Published var snapshot: JobSnapshot?
-    @Published var status = "导入视频，选择素材与区间，然后选择快速或精确模式。"
+    @Published var status = "导入视频或音频进行预览；视频可选择区间与导出模式。"
     @Published var issue: String?
     @Published var phase = "idle"
     @Published var startText = "0.000000" { didSet { saveSelectedEdits() } }
@@ -98,6 +144,7 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var isImporting = false
     @Published var isExporting = false
     @Published private(set) var isConnecting = false
+    @Published private(set) var steppingPreviewFrame = false
     private(set) var trace: [JobSnapshot] = []
     private(set) var probeSnapshot: JobSnapshot?
     private(set) var accessDiagnostics = AccessDiagnostics()
@@ -112,6 +159,11 @@ final class WorkspaceModel: ObservableObject {
     private var exportJob: String?
     private var probeJob: String?
     private var pendingCancel = false
+    private var audioPreviewOwner: AudioPreviewOwner?
+    private var retiredPreviewDiagnostics = BridgeDiagnostics()
+    @Published private(set) var isPreparingAudioPreview = false
+    var audioPreviewDirectory: URL? { audioPreviewOwner?.root }
+    var audioPreviewAccessRetained: Bool { audioPreviewOwner?.sourceAccess.retained == true }
     private var stopImportRequested = false
     private var configured: BackendConfiguration?
     var unconfirmedCleanup = false
@@ -120,17 +172,28 @@ final class WorkspaceModel: ObservableObject {
     private(set) var shutdownDiagnostics = ShutdownDiagnostics()
     private(set) var cachedBridgeDiagnostics = BridgeDiagnostics()
 
-    init(legacyCompatibility: Bool = false, historyPath: URL? = nil, queueEnabled: Bool = true) {
+    init(legacyCompatibility: Bool = false, historyPath: URL? = nil, queueEnabled: Bool = true, historyLedger: RecentTaskLedger? = nil) {
         self.legacyCompatibility = legacyCompatibility
         self.queueEnabled = queueEnabled && !legacyCompatibility
-        recentStore = RecentTaskStore(path: historyPath ?? ProcessInfo.processInfo.environment["MEDIASTUDIO_HISTORY_PATH"].map { URL(fileURLWithPath: $0) })
+        recentStore = RecentTaskStore(path: historyPath ?? ProcessInfo.processInfo.environment["MEDIASTUDIO_HISTORY_PATH"].map { URL(fileURLWithPath: $0) }, ledger: historyLedger)
         tasks = legacyCompatibility ? [] : recentStore.load()
         strategy = legacyCompatibility ? .legacyStreamCopy : .streamCopyV1
+        if !legacyCompatibility, let ledger = recentStore.sharedLedger {
+            issue = ledger.persistenceIssue
+            historyObservation = ledger.videoIDsDidChange.sink { [weak self] ids in
+                guard let self else { return }
+                let removed = Set(self.tasks.filter { $0.terminal && !ids.contains($0.id) }.map(\.id))
+                self.tasks.removeAll { removed.contains($0.id) }
+                self.resultURLs = self.resultURLs.filter { !removed.contains($0.key) }
+                self.queueRequests = self.queueRequests.filter { !removed.contains($0.key) }
+                if let selected = self.selectedTaskId, removed.contains(selected) { self.selectedTaskId = self.tasks.first?.id }
+            }
+        }
     }
-    var active: Bool { isImporting || isExporting || isConnecting || stopping || unconfirmedCleanup || phase == "close_failed" }
-    var canImport: Bool { !isSubmitting && pendingQueue == nil && !isImporting && !isConnecting && !stopping && !unconfirmedCleanup }
-    var canEdit: Bool { mediaInfo != nil && !stopping && !unconfirmedCleanup }
-    var hasRunningJob: Bool { isExporting || probeJob != nil }
+    var active: Bool { isPreparingAudioPreview || isSubmitting || isImporting || isExporting || isConnecting || stopping || unconfirmedCleanup || phase == "close_failed" }
+    var canImport: Bool { !isPreparingAudioPreview && !isSubmitting && pendingQueue == nil && !isImporting && !isConnecting && !stopping && !unconfirmedCleanup }
+    var canEdit: Bool { mediaInfo?.isAudioOnly == false && !stopping && !unconfirmedCleanup }
+    var hasRunningJob: Bool { isPreparingAudioPreview || isExporting || probeJob != nil }
     var selectedRange: MediaRange? {
         guard let mediaInfo, let start = parseTimeText(startText), let end = parseTimeText(endText),
               start >= 0, end > start, end <= mediaInfo.durationUs else { return nil }
@@ -138,8 +201,9 @@ final class WorkspaceModel: ObservableObject {
     }
     var canExport: Bool {
         guard (queueEnabled ? (!isSubmitting && pendingQueue == nil) : !isExporting), !isConnecting, !stopping, !unconfirmedCleanup,
-              configured == backendConfiguration, mediaInfo != nil, selectedRange != nil,
+              configured == backendConfiguration, mediaInfo?.streams.contains(where: { $0.codecType == "video" }) == true, selectedRange != nil,
               connection?.capabilities.features[strategy.capabilityKey]?.available == true,
+              (videoTransform.isIdentity || (queueEnabled && strategy == .transcodeStandard && connection?.capabilities.features["video_transform_v1"]?.available == true)),
               (strategy.transcodePreset == nil || connection?.capabilities.features["transcode"]?.profiles?.contains(strategy.profile ?? "") == true) else { return false }
         return strategy == .legacyStreamCopy ? mediaInfo?.trimDisplayMetadataSupported != false
             : mediaInfo?.core003DisplayMetadataSupported != false
@@ -151,13 +215,15 @@ final class WorkspaceModel: ObservableObject {
         let host = BackendConfiguration.hostDefault(core003Enabled: !legacyCompatibility, core004Enabled: queueEnabled)
         return BackendConfiguration(ffmpeg: ffmpegPath, ffprobe: ffprobePath, timeoutMs: host.timeoutMs,
                                     maxOutputBytes: host.maxOutputBytes, core003Enabled: !legacyCompatibility,
-                                    accurateReencodeTimeoutMs: host.accurateReencodeTimeoutMs, core004Enabled: queueEnabled, transcodeTimeoutMs: host.transcodeTimeoutMs)
+                                    accurateReencodeTimeoutMs: host.accurateReencodeTimeoutMs, core004Enabled: queueEnabled,
+                                    videoTransformEnabled: host.videoTransformEnabled, transcodeTimeoutMs: host.transcodeTimeoutMs)
     }
     func updatePhase() {
         guard !closed else { phase = "closed"; return }
         if stopping { phase = "closing" }
         else if unconfirmedCleanup { phase = "cleanup_failed" }
         else if isExporting { phase = "exporting" }
+        else if isPreparingAudioPreview { phase = "preparing_preview" }
         else if isImporting { phase = "probing" }
         else if isConnecting { phase = "connecting" }
         else { phase = "idle" }
@@ -175,17 +241,28 @@ final class WorkspaceModel: ObservableObject {
     }
     func saveSelectedEdits() {
         guard !updatingSelection, let id = selectedAssetId, let i = assets.firstIndex(where: { $0.id == id }) else { return }
-        assets[i].startText = startText; assets[i].endText = endText; assets[i].mode = strategy; assets[i].audioSelection = audioSelection
+        assets[i].startText = startText; assets[i].endText = endText; assets[i].mode = strategy; assets[i].audioSelection = audioSelection; assets[i].videoTransform = videoTransform
     }
-    func persistTasks() {
-        guard !legacyCompatibility else { return }
-        do { try recentStore.save(tasks) }
-        catch { record("最近任务摘要未保存，可稍后重试。") }
+    @discardableResult
+    func persistTasks(_ values: [WorkspaceTask]? = nil) -> Bool {
+        guard !legacyCompatibility else { return true }
+        do { try NativeHeartbeat.shared.measure(.historyPersist) { try recentStore.save(values ?? tasks) }; return true }
+        catch { record("最近任务摘要未保存，可稍后重试。"); return false }
+    }
+    func persistHistoryClear(_ values: [WorkspaceTask]) -> Bool {
+        guard !legacyCompatibility else { return true }
+        do { try recentStore.clearTerminated(keepingVideos: values); return true }
+        catch { record("最近任务摘要未清除，可稍后重试。"); return false }
     }
     func clearHistory() {
         if queueEnabled { Task { await clearQueueHistory() }; return }
-        tasks.removeAll { $0.terminal }; resultURLs = resultURLs.filter { key, _ in tasks.contains { $0.id == key } }
-        selectedTaskId = tasks.first?.id; persistTasks(); status = "已清除已完成的最近任务；活动任务仍保留。"
+        let remaining = tasks.filter { !$0.terminal }
+        guard persistHistoryClear(remaining) else {
+            issue = "最近任务摘要未能清除，原记录仍保留；请检查本机存储后重试。"
+            status = "未确认清除最近任务。"; return
+        }
+        tasks = remaining; resultURLs = resultURLs.filter { key, _ in tasks.contains { $0.id == key } }
+        selectedTaskId = tasks.first?.id; status = "已清除已完成的最近任务；活动任务仍保留。"
     }
     func observe(_ value: JobSnapshot, exportId: UUID? = nil) {
         if exportId != nil || (snapshot?.operation != "trim" && !isExporting) { snapshot = value }
@@ -309,8 +386,10 @@ final class WorkspaceModel: ObservableObject {
                 if selectedAssetId == item.id { await selectAsset(id: item.id, saveCurrent: false) }
             } catch {
                 guard !stopping else { break }
-                if let i = assets.firstIndex(where: { $0.id == item.id }) { assets[i].state = "failed"; assets[i].failure = error.localizedDescription }
-                issue = error.localizedDescription
+                let message = (error as? CoreSubmissionRejection).map { friendlyError($0.failure) }
+                    ?? error.localizedDescription
+                if let i = assets.firstIndex(where: { $0.id == item.id }) { assets[i].state = "failed"; assets[i].failure = message }
+                issue = message
                 do { try await Task.detached { [probeBridge] in try await probeBridge.close() }.value }
                 catch { unconfirmedCleanup = true; break }
             }
@@ -326,23 +405,69 @@ final class WorkspaceModel: ObservableObject {
         }
     }
     func selectAsset(id: UUID, saveCurrent: Bool = true) async {
-        guard !stopping, let item = assets.first(where: { $0.id == id }) else { return }
+        guard !stopping, !unconfirmedCleanup, let item = assets.first(where: { $0.id == id }) else { return }
         if saveCurrent { saveSelectedEdits() }; selectionToken = UUID(); let token = selectionToken
         selectedAssetId = id; updatingSelection = true
-        sourceURL = item.url; mediaInfo = item.info; startText = item.startText; endText = item.endText; strategy = item.mode; audioSelection = item.audioSelection
+        sourceURL = item.url; mediaInfo = item.info; startText = item.startText; endText = item.endText; strategy = item.mode; audioSelection = item.audioSelection; videoTransform = item.videoTransform
         updatingSelection = false; saveSelectedEdits(); issue = item.failure
         preview.clear()
+        do { try await stopAudioPreview() }
+        catch { unconfirmedCleanup = true; issue = "原音预览清理尚未确认，已保留文件访问并停止新任务。"; updatePhase(); return }
+        guard token == selectionToken, !stopping else { return }
         if let info = item.info {
             do { try await preview.load(url: item.url, media: info) }
-            catch { if token == selectionToken && !stopping { preview.status = "系统预览不可用；导出能力由 Core 判断。"; record("系统预览未就绪") } }
+            catch {
+                guard token == selectionToken, !stopping else { return }
+                if info.isAudioOnly {
+                    await prepareAudioPreview(item: item, media: info, token: token)
+                } else {
+                    preview.status = "系统预览不可用：\(error.localizedDescription)"; record("系统预览未就绪")
+                }
+            }
         }
         guard token == selectionToken, !stopping else { return }
         if let failure = item.failure { issue = failure }
     }
+    private func prepareAudioPreview(item: WorkspaceAsset, media: MediaInfo, token: UUID) async {
+        isPreparingAudioPreview = true
+        defer { if token == selectionToken { isPreparingAudioPreview = false }; updatePhase() }
+        do {
+            try await preview.shutdown()
+            guard token == selectionToken, !stopping else { return }
+            let access = hold(item.url)
+            let owner: AudioPreviewOwner
+            do { owner = try AudioPreviewOwner(sourceAccess: access) }
+            catch { release(access); throw error }
+            audioPreviewOwner = owner
+            preview.status = "正在准备原音预览…"
+            let url = try await owner.prepare(source: item.url, media: media, configuration: backendConfiguration)
+            guard token == selectionToken, !stopping, audioPreviewOwner === owner else { return }
+            try await preview.load(url: url, media: media)
+            guard token == selectionToken, !stopping else { return }
+            preview.status = "原音预览已就绪"
+        } catch {
+            guard token == selectionToken, !stopping else { return }
+            let message = (error as? CoreSubmissionRejection).map { friendlyError($0.failure) } ?? error.localizedDescription
+            do { try await stopAudioPreview() }
+            catch { unconfirmedCleanup = true; issue = "原音预览清理尚未确认，已保留文件访问并停止新任务。"; return }
+            preview.status = "系统预览不可用：\(message)"
+        }
+    }
+    private func stopAudioPreview() async throws {
+        let owner = audioPreviewOwner
+        try await preview.shutdown()
+        if let owner {
+            try await owner.shutdown()
+            let diagnostics = await owner.bridge.diagnostics()
+            if owner.sourceAccess.retained { retiredPreviewDiagnostics.accumulate(diagnostics); release(owner.sourceAccess) }
+            if audioPreviewOwner === owner { audioPreviewOwner = nil }
+        }
+        if audioPreviewOwner == nil { isPreparingAudioPreview = false }
+    }
     func removeAsset(id: UUID) async {
         guard !isImporting, !stopping, !unconfirmedCleanup else { issue = "素材仍在使用或清理中，请稍后移除。"; return }
         guard activeExport?.draft.assetId != id, !queueLeases.keys.contains(where: { queueRequests[$0]?.draft.assetId == id }) else { issue = "该素材仍用于活动导出，请等待任务结束后移除。"; return }
-        do { try await preview.shutdown() } catch { issue = error.localizedDescription; return }
+        do { try await stopAudioPreview() } catch { unconfirmedCleanup = true; issue = "预览清理尚未确认，已保留文件访问。"; updatePhase(); return }
         let wasSelected = selectedAssetId == id
         release(leases.removeValue(forKey: id)); assets.removeAll { $0.id == id }
         if wasSelected {
@@ -353,7 +478,7 @@ final class WorkspaceModel: ObservableObject {
     private func currentDraft() -> ExportDraft? {
         guard canExport, let id = selectedAssetId, let sourceURL, let range = selectedRange else { return nil }
         return ExportDraft(assetId: id, sourceURL: sourceURL, sourceName: sourceURL.lastPathComponent, range: range,
-                           mode: strategy, configuration: backendConfiguration, audioSelection: strategy.transcodePreset == nil ? .all : audioSelection, expectedAudioIndices: mediaInfo?.streams.filter { $0.codecType == "audio" }.map(\.index))
+                           mode: strategy, configuration: backendConfiguration, audioSelection: strategy.transcodePreset == nil ? .all : audioSelection, expectedAudioIndices: mediaInfo?.streams.filter { $0.codecType == "audio" }.map(\.index), videoTransform: videoTransform.isIdentity ? nil : videoTransform)
     }
     func export(to url: URL) async {
         if queueEnabled {
@@ -363,13 +488,13 @@ final class WorkspaceModel: ObservableObject {
         guard let draft = currentDraft() else { issue = rangeIssue ?? "当前媒体、模式或组件尚不可导出。"; return }
         await export(draft: draft, to: url)
     }
-    private func export(draft: ExportDraft, to url: URL) async {
-        if queueEnabled { await submitQueue(drafts: [draft], destinations: [url]); return }
+    private func export(draft: ExportDraft, to url: URL, authorizedFolder: URL? = nil, previewSpace: Bool = false) async {
+        if queueEnabled { await submitQueue(drafts: [draft], destinations: [url], authorizedFolder: authorizedFolder, previewSpace: previewSpace); return }
         guard !isExporting, !stopping, !unconfirmedCleanup, assets.contains(where: { $0.id == draft.assetId }) else { return }
         let localId = UUID(); isExporting = true; pendingCancel = false; closed = false; issue = nil
         destinationURL = url; snapshot = nil
         activeExport = ActiveExport(id: localId, draft: draft, destinationURL: url)
-        exportSourceAccess = hold(draft.sourceURL); outputAccess = hold(url.deletingLastPathComponent()); updatePhase()
+        exportSourceAccess = hold(draft.sourceURL); outputAccess = hold(authorizedFolder ?? url.deletingLastPathComponent()); updatePhase()
         var safe = false
         defer {
             isExporting = false
@@ -417,6 +542,11 @@ final class WorkspaceModel: ObservableObject {
         }
     }
     func cancel() async {
+        if isPreparingAudioPreview {
+            selectionToken = UUID(); stopImportRequested = isImporting
+            do { try await stopAudioPreview(); status = "原音预览准备已停止。" }
+            catch { unconfirmedCleanup = true; issue = "原音预览清理尚未确认，已保留文件访问。"; updatePhase(); return }
+        }
         if queueEnabled && (isExporting || isSubmitting) { await cancelQueue(); return }
         guard !stopping else { return }
         if isExporting {
@@ -432,6 +562,9 @@ final class WorkspaceModel: ObservableObject {
     private func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
         let value = start.duration(to: .now).components
         return Double(value.seconds) * 1000 + Double(value.attoseconds) / 1_000_000_000_000_000
+    }
+    func beginShutdown() {
+        stopping = true; updatePhase(); status = "正在停止任务并清理…"
     }
     func shutdown() async throws {
         guard !closed else { return }
@@ -483,6 +616,7 @@ final class WorkspaceModel: ObservableObject {
         // preflight. Keep its owner and leases until the operation has returned.
         // The outer application watchdog continues to run while this yields.
         while isSubmitting || queueRefreshInProgress { try await Task.sleep(for: .milliseconds(10)) }
+        try await stopAudioPreview()
         try await exportBridge.close(); try await probeBridge.close()
         let snapshots = await exportBridge.closedJobSnapshots()
         if queueEnabled {
@@ -493,6 +627,7 @@ final class WorkspaceModel: ObservableObject {
         try await preview.shutdown()
         release(exportSourceAccess); exportSourceAccess = nil; release(outputAccess); outputAccess = nil
         for id in Array(queueLeases.keys) { releaseQueueLeases(id) }; pendingQueue = nil
+        pendingQueueNeedsConfirmation = false; storagePreview = nil
         queuePollTask?.cancel(); queuePollTask = nil
         for lease in leases.values { release(lease) }; leases.removeAll()
         activeExport = nil; exportJob = nil; probeJob = nil; isExporting = false; isImporting = false
@@ -501,71 +636,154 @@ final class WorkspaceModel: ObservableObject {
     }
     func diagnostics() async -> BridgeDiagnostics {
         var value = await probeBridge.diagnostics(); value.accumulate(await exportBridge.diagnostics())
+        value.accumulate(retiredPreviewDiagnostics)
+        if let owner = audioPreviewOwner { value.accumulate(await owner.bridge.diagnostics()) }
         cachedBridgeDiagnostics = value; return value
     }
     func setInPoint() { startText = timeText(preview.positionUs) }
     func setOutPoint() { endText = timeText(preview.positionUs) }
+    var canStepPreviewFrame: Bool { canEdit && preview.ready && !steppingPreviewFrame && mediaInfo.flatMap(PreviewFrameGrid.init) != nil }
+    func stepPreviewFrame(direction: Int) async {
+        guard direction == -1 || direction == 1, canStepPreviewFrame,
+              let mediaInfo, let grid = PreviewFrameGrid(media: mediaInfo) else { return }
+        let token = selectionToken
+        steppingPreviewFrame = true
+        defer { steppingPreviewFrame = false }
+        preview.pause()
+        let index = grid.nextIndex(from: preview.positionUs, direction: direction)
+        do {
+            try await preview.seekFrame(index: index, rateNumerator: grid.rateNumerator,
+                                        rateDenominator: grid.rateDenominator, normalizedUs: grid.microseconds(at: index))
+        } catch { if token == selectionToken && !stopping { issue = error.localizedDescription } }
+    }
     func chooseInput() {
-        guard canImport else { return }
-        let panel = NSOpenPanel(); panel.title = "导入媒体"; panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
-        panel.begin { [weak self] response in
-            guard response == .OK else { return }; let urls = panel.urls
+        guard canImport, !NativeFilePanels.hasPending else { return }
+        guard let panel = NativeFilePanels.open() else { return }; panel.title = "导入媒体"; panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .audio]
+        NativeFilePanels.begin(panel) { [weak self] selection in
+            guard selection.response == .OK else { return }; let urls = selection.urls
             Task { @MainActor in await self?.importURLs(urls) }
         }
     }
     func chooseOutput() {
+        guard !NativeFilePanels.hasPending else { return }
         guard let draft = currentDraft() else { return }
-        let panel = NSSavePanel(); panel.title = "导出为新的 MP4"; panel.allowedContentTypes = [.mpeg4Movie]
-        panel.nameFieldStringValue = draft.sourceURL.deletingPathExtension().lastPathComponent + (draft.mode.isReencoded ? "-精确片段.mp4" : "-快速片段.mp4")
-        panel.message = draft.mode.isReencoded ? "精确模式会重新编码，属于有损导出。已有文件不会替换。" : "快速模式不重新编码，实际范围可扩展至关键帧。已有文件不会替换。"
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in await self?.export(draft: draft, to: url) }
+        let name = draft.sourceURL.deletingPathExtension().lastPathComponent + (draft.mode.isReencoded ? "-精确片段.mp4" : "-快速片段.mp4")
+        chooseAuthorizedOutput(title: "导出为新的 MP4", name: name) { [weak self] url, folder in
+            await self?.export(draft: draft, to: url, authorizedFolder: folder, previewSpace: true)
+        }
+    }
+    // Core stages and commits beside the result, so a save-panel file grant
+    // alone is insufficient in the sandbox. Keep the actual directory URL.
+    func chooseAuthorizedOutput(title: String, name: String, submit: @escaping @MainActor (URL, URL) async -> Void) {
+        guard !NativeFilePanels.hasPending else { return }
+        guard let folderPanel = NativeFilePanels.open() else { return }; folderPanel.title = "选择导出文件夹"
+        folderPanel.message = "请选择导出文件夹，以便安全创建和清理临时文件。"
+        folderPanel.canChooseFiles = false; folderPanel.canChooseDirectories = true; folderPanel.canCreateDirectories = true
+        NativeFilePanels.begin(folderPanel) { [weak self] selection in
+            guard selection.response == .OK, let folder = selection.url, let self else { return }
+            let access = self.hold(folder)
+            guard let panel = NativeFilePanels.save() else { self.release(access); return }; panel.title = title; panel.allowedContentTypes = [.mpeg4Movie]
+            panel.directoryURL = folder; panel.nameFieldStringValue = name
+            panel.message = "请在刚授权的文件夹中选择新文件名；已有文件不会替换。"
+            NativeFilePanels.begin(panel) { [weak self] selection in
+                guard let self else { access.release(); return }
+                guard selection.response == .OK, let url = selection.url else { self.release(access); return }
+                guard url.deletingLastPathComponent().standardizedFileURL == folder.standardizedFileURL else {
+                    self.issue = "请选择刚刚授权的导出文件夹，再试一次。"; self.release(access); return
+                }
+                Task { @MainActor in
+                    await submit(url, folder)
+                    self.release(access)
+                }
+            }
         }
     }
     func chooseTool(ffmpeg: Bool) {
-        guard !active else { return }
-        let panel = NSOpenPanel(); panel.title = ffmpeg ? "选择 FFmpeg" : "选择 ffprobe"; panel.canChooseDirectories = false
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
+        guard !active, !NativeFilePanels.hasPending else { return }
+        guard let panel = NativeFilePanels.open() else { return }; panel.title = ffmpeg ? "选择 FFmpeg" : "选择 ffprobe"; panel.canChooseDirectories = false
+        NativeFilePanels.begin(panel, allowSheetHost: true) { [weak self] selection in
+            guard selection.response == .OK, let url = selection.url else { return }
             Task { @MainActor in
                 if ffmpeg { self?.ffmpegPath = url.path } else { self?.ffprobePath = url.path }
                 await self?.connect()
             }
         }
     }
-    private func resultURL(_ id: UUID?) -> URL? {
+    func restoreBundledTools() async {
+        guard !active, !stopping, !unconfirmedCleanup,
+              let directory = Bundle.main.executableURL?.deletingLastPathComponent() else { return }
+        let ffmpeg = directory.appendingPathComponent("ffmpeg")
+        let ffprobe = directory.appendingPathComponent("ffprobe")
+        guard [ffmpeg, ffprobe].allSatisfy({ FileManager.default.isExecutableFile(atPath: $0.path) }) else {
+            issue = "包内媒体组件缺失，请恢复完整应用后重试。"; return
+        }
+        ffmpegPath = ffmpeg.path; ffprobePath = ffprobe.path
+        await connect()
+    }
+    private func resultAccess(_ id: UUID?) -> (url: URL, access: SecurityAccess)? {
         guard let id, let item = tasks.first(where: { $0.id == id }), item.state == "succeeded" else { return nil }
-        return resultURLs[id].flatMap { FileManager.default.isReadableFile(atPath: $0.path) ? $0 : nil }
-            ?? RecentTaskStore.resolve(item.destinationBookmark)
+        var candidates: [URL] = []
+        if let cached = resultURLs[id] { candidates.append(cached) }
+        if let restored = RecentTaskStore.resolve(item.destinationBookmark), !candidates.contains(restored) { candidates.append(restored) }
+        for url in candidates {
+            let access = hold(url)
+            let metadata = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if metadata?.isRegularFile == true, metadata?.isSymbolicLink != true,
+               FileManager.default.isReadableFile(atPath: url.path) { return (url, access) }
+            release(access)
+        }
+        return nil
+    }
+    // Readiness snapshot for independent native QA. Opening/revealing below
+    // keeps the same scope held through the system operation instead.
+    func resultURL(_ id: UUID?) -> URL? {
+        guard let result = resultAccess(id) else { return nil }
+        defer { release(result.access) }
+        return result.url
+    }
+    @discardableResult
+    func authorizeResult(taskId: UUID, url: URL) -> Bool {
+        guard let index = tasks.firstIndex(where: { $0.id == taskId && $0.state == "succeeded" }) else { return false }
+        let access = hold(url)
+        defer { release(access) }
+        let metadata = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard url.lastPathComponent == tasks[index].destinationName,
+              metadata?.isRegularFile == true, metadata?.isSymbolicLink != true,
+              FileManager.default.isReadableFile(atPath: url.path) else {
+            issue = "请选择与摘要同名、可读取的普通结果文件。"; return false
+        }
+        guard let bookmark = RecentTaskStore.bookmark(url) else {
+            issue = "无法保存结果文件授权，请重新选择文件。"; return false
+        }
+        var updated = tasks; updated[index].destinationBookmark = bookmark
+        guard persistTasks(updated) else {
+            issue = "结果文件授权未能保存，原记录仍保留；请检查本机存储后重试。"; return false
+        }
+        tasks = updated; resultURLs[taskId] = url
+        issue = nil; status = "已更新结果文件授权。"; return true
     }
     func reauthorizeResult(taskId: UUID) {
+        guard !NativeFilePanels.hasPending else { return }
         guard let item = tasks.first(where: { $0.id == taskId }), item.state == "succeeded" else { return }
-        let panel = NSOpenPanel(); panel.title = "重新授权结果文件"; panel.canChooseDirectories = false
+        guard let panel = NativeFilePanels.open() else { return }; panel.title = "重新授权结果文件"; panel.canChooseDirectories = false
         panel.message = "请选择结果文件：\(item.destinationName)。文件移动后需要重新授权；不会重新运行导出。"
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
+        NativeFilePanels.begin(panel) { [weak self] selection in
+            guard selection.response == .OK, let url = selection.url else { return }
             Task { @MainActor in
-                guard let self, let index = self.tasks.firstIndex(where: { $0.id == taskId }) else { return }
-                let access = self.hold(url)
-                defer { self.release(access) }
-                guard url.lastPathComponent == item.destinationName,
-                      (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-                    self.issue = "请选择与摘要同名的普通结果文件。"; return
-                }
-                self.tasks[index].destinationBookmark = RecentTaskStore.bookmark(url)
-                self.resultURLs[taskId] = url; self.persistTasks(); self.status = "已更新结果文件授权。"
+                self?.authorizeResult(taskId: taskId, url: url)
             }
         }
     }
     func revealResult(taskId: UUID? = nil) {
-        guard let url = resultURL(taskId ?? selectedTaskId) else { issue = "结果已移动或授权失效，请重新选择文件。"; return }
-        let access = hold(url); NSWorkspace.shared.activateFileViewerSelecting([url]); release(access)
+        guard let result = resultAccess(taskId ?? selectedTaskId) else { issue = "结果已移动、不可读取或授权失效，请重新授权或重新选择文件。"; return }
+        defer { release(result.access) }
+        NSWorkspace.shared.activateFileViewerSelecting([result.url])
     }
     func openResult(taskId: UUID? = nil) {
-        guard let url = resultURL(taskId ?? selectedTaskId) else { issue = "结果已移动或授权失效，请重新选择文件。"; return }
-        let access = hold(url); let opened = NSWorkspace.shared.open(url); release(access)
+        guard let result = resultAccess(taskId ?? selectedTaskId) else { issue = "结果已移动、不可读取或授权失效，请重新授权或重新选择文件。"; return }
+        defer { release(result.access) }
+        let opened = NSWorkspace.shared.open(result.url)
         if !opened { issue = "无法打开结果，请在 Finder 检查文件。" }
     }
 }

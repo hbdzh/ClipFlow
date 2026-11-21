@@ -1,0 +1,24 @@
+--- a/common/pixel.c
++++ b/common/pixel.c
+@@ -736,7 +736,8 @@
+ 
+     if( mb_x > 0 )
+         score_field += 512 - h->mb.field[mb_xy        -1]*1024;
+-    if( mb_y > 0 )
++    /* A previous thread slice may not have written its field flags yet. */
++    if( mb_y > h->i_threadslice_start )
+         score_field += 512 - h->mb.field[mb_xy-mb_stride]*1024;
+ 
+     return (score_field < score_frame);
+--- a/common/macroblock.c
++++ b/common/macroblock.c
+@@ -769,7 +769,8 @@
+         }
+         else
+         {
+-            if( mb_interlaced && top >= 0 )
++            /* Top positions are unused at the start of a thread slice. */
++            if( mb_interlaced && top >= 0 && mb_y > h->i_threadslice_start )
+             {
+                 if( !h->mb.field[top] )
+                 {

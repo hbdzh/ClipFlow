@@ -10,11 +10,6 @@ struct SelfTestReport: Codable, Sendable {
     let bridgeDiagnostics: BridgeDiagnostics
 }
 
-struct CheckFailure: Error, LocalizedError, Sendable {
-    let message: String
-    var errorDescription: String? { message }
-}
-
 func require(_ condition: Bool, _ message: String) throws {
     if !condition { throw CheckFailure(message: message) }
 }
